@@ -247,7 +247,7 @@ def actual_show_individual_popup(reminder_title, reminder_time_24h, reminder_id=
         popup.attributes('-topmost', True)
         app_icon_photo = getattr(app_instance_ref, 'app_icon_photo', None)
         if app_icon_photo:
-            popup.iconphoto(True, app_icon_photo)
+             popup.iconphoto(True, app_icon_photo)
         
         formatted_time_ampm = format_time_to_ampm(reminder_time_24h)
         label_text = f"Reminder: {reminder_title}\nTime: {formatted_time_ampm}"
@@ -582,7 +582,7 @@ class ReminderApp:
         ttk.Button(button_frame, text="Update", command=self.open_update_reminder_window).pack(side=tk.LEFT, padx=5)
         ttk.Button(button_frame, text="Delete", command=self.delete_selected_reminder).pack(side=tk.LEFT, padx=5)
         ttk.Button(button_frame, text="Refresh", command=self.populate_reminders_list).pack(side=tk.LEFT, padx=5)
-
+        
         # Filter frame
         filter_frame = ttk.Frame(main_frame)
         filter_frame.grid(row=1, column=0, columnspan=2, pady=5, sticky=tk.EW)
@@ -640,7 +640,7 @@ class ReminderApp:
 
         self.populate_reminders_list()
         if main_gui_visible:
-            self.show_app_init_reminders_popup()
+             self.show_app_init_reminders_popup()
 
     def apply_filters(self):
         """Apply current filter and sort settings to the reminders list."""
@@ -747,8 +747,30 @@ class AddReminderWindow:
         app_icon_photo = getattr(self.main_app, 'app_icon_photo', None)
         if app_icon_photo: self.add_window.iconphoto(True, app_icon_photo)
 
-        form_frame = ttk.Frame(self.add_window, padding="15")
-        form_frame.pack(fill=tk.BOTH, expand=True)
+        # --- SCROLLABLE FORM SETUP ---
+        self.canvas = tk.Canvas(self.add_window, borderwidth=0, background="#f8f8f8") # Make canvas an instance variable
+        form_frame = ttk.Frame(self.canvas, padding="15")
+        vscrollbar = ttk.Scrollbar(self.add_window, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=vscrollbar.set)
+        vscrollbar.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.canvas.create_window((0, 0), window=form_frame, anchor="nw")
+
+        def on_frame_configure(event):
+            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        form_frame.bind("<Configure>", on_frame_configure)
+
+        # Add mousewheel scrolling support
+        def _on_mousewheel(event):
+            self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+
+        # Bind mousewheel to the canvas
+        self.canvas.bind("<MouseWheel>", _on_mousewheel)
+        # Optional: bind to the form_frame and its children if canvas doesn't always have focus
+        form_frame.bind("<MouseWheel>", _on_mousewheel)
+        # Add bindings for Linux/Mac if needed
+        self.canvas.bind_all("<Button-4>", _on_mousewheel) # For Linux
+        self.canvas.bind_all("<Button-5>", _on_mousewheel) # For Linux
 
         # Title
         ttk.Label(form_frame, text="Title:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
@@ -830,18 +852,22 @@ class AddReminderWindow:
         self.end_condition_inputs_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
         
         # Occurrences input with default value for new reminder
-        self.occurrences_var = tk.StringVar(value="1")
+        self.occurrences_var = tk.StringVar(value="1") # Default for new reminder is "1"
         self.occurrences_spinbox = ttk.Spinbox(self.end_condition_inputs_frame, from_=1, to=MAX_OCCURRENCES,
                                              textvariable=self.occurrences_var, width=5)
-        
+        # self.occurrences_spinbox.pack(...) is handled by update_end_condition_inputs
+
         # Create the "times" label once
         self.occurrences_label = ttk.Label(self.end_condition_inputs_frame, text="times")
+        # self.occurrences_label.pack(...) is handled by update_end_condition_inputs
         
         # End date calendar
         self.end_date_cal = Calendar(self.end_condition_inputs_frame, selectmode='day', 
                                    date_pattern='yyyy-mm-dd', font="Arial 9")
-        
-        # Initially hide end condition inputs
+        # self.end_date_cal.pack(...) is handled by update_end_condition_inputs
+        # Initial selection for end_date_cal is handled by update_end_condition_inputs when "On Date" is picked
+
+        # Initially hide/show end condition inputs based on default "Never"
         self.update_end_condition_inputs()
 
         # Save button
@@ -943,6 +969,9 @@ class AddReminderWindow:
         self.main_app.populate_reminders_list()
         self.add_window.destroy()
 
+    def _on_mousewheel(self, event):
+        self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+
 class EditReminderWindow:
     def __init__(self, parent_root, reminder, main_app_ref):
         self.parent = parent_root
@@ -956,8 +985,30 @@ class EditReminderWindow:
         app_icon_photo = getattr(self.main_app, 'app_icon_photo', None)
         if app_icon_photo: self.edit_window.iconphoto(True, app_icon_photo)
 
-        form_frame = ttk.Frame(self.edit_window, padding="15")
-        form_frame.pack(fill=tk.BOTH, expand=True)
+        # --- SCROLLABLE FORM SETUP ---
+        self.canvas = tk.Canvas(self.edit_window, borderwidth=0, background="#f8f8f8") # Make canvas an instance variable
+        form_frame = ttk.Frame(self.canvas, padding="15")
+        vscrollbar = ttk.Scrollbar(self.edit_window, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=vscrollbar.set)
+        vscrollbar.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.canvas.create_window((0, 0), window=form_frame, anchor="nw")
+
+        def on_frame_configure(event):
+            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        form_frame.bind("<Configure>", on_frame_configure)
+
+        # Add mousewheel scrolling support
+        def _on_mousewheel(event):
+            self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+
+        # Bind mousewheel to the canvas
+        self.canvas.bind("<MouseWheel>", _on_mousewheel)
+        # Optional: bind to the form_frame and its children if canvas doesn't always have focus
+        form_frame.bind("<MouseWheel>", _on_mousewheel)
+        # Add bindings for Linux/Mac if needed
+        self.canvas.bind_all("<Button-4>", _on_mousewheel) # For Linux
+        self.canvas.bind_all("<Button-5>", _on_mousewheel) # For Linux
 
         # Title
         ttk.Label(form_frame, text="Title:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
@@ -1173,7 +1224,7 @@ class EditReminderWindow:
         if not title:
             messagebox.showerror("Input Error", "Title cannot be empty.", parent=self.edit_window)
             return
-
+        
         if not hour_12_str.isdigit() or not minute_str.isdigit():
             messagebox.showerror("Input Error", "Hour/Minute must be numeric.", parent=self.edit_window)
             return
@@ -1196,19 +1247,16 @@ class EditReminderWindow:
             try:
                 occurrences = int(self.occurrences_var.get())
                 if not (1 <= occurrences <= MAX_OCCURRENCES):
-                    messagebox.showerror("Input Error", f"Number of occurrences must be between 1 and {MAX_OCCURRENCES}.", 
-                                       parent=self.edit_window)
+                    messagebox.showerror("Input Error", f"Number of occurrences must be between 1 and {MAX_OCCURRENCES}.", parent=self.edit_window)
                     return
             except ValueError:
-                messagebox.showerror("Input Error", "Number of occurrences must be a valid number.", 
-                                   parent=self.edit_window)
+                messagebox.showerror("Input Error", "Number of occurrences must be a valid number.", parent=self.edit_window)
                 return
         elif end_condition_type == "date":
             end_date = datetime.strptime(self.end_date_cal.get_date(), "%Y-%m-%d").date()
             start_date = datetime.strptime(selected_date_str, "%Y-%m-%d").date()
             if end_date <= start_date:
-                messagebox.showerror("Input Error", "End date must be after start date.", 
-                                   parent=self.edit_window)
+                messagebox.showerror("Input Error", "End date must be after start date.", parent=self.edit_window)
                 return
 
         # Determine if recurrence parameters changed
