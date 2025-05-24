@@ -32,17 +32,27 @@ ENV/
 *.swo
 
 # Application specific
-*.json
-*.lock
 *.log
+app.log
+app.log.*
+reminders.json
+app_config.json
+app.lock
+
+# Build
+*.spec
+build/
+dist/
+
+# OS specific
+.DS_Store
+Thumbs.db
 
 # Windows
-Thumbs.db
 ehthumbs.db
 Desktop.ini
 $RECYCLE.BIN/
 
 # macOS
-.DS_Store
 .AppleDouble
 .LSOverride 

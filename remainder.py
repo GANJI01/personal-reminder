@@ -1,5 +1,6 @@
 import json
-from datetime import date, datetime, time # Ensure time is imported from datetime
+from datetime import date, datetime, time, timedelta # Ensure time is imported from datetime
+from dateutil.relativedelta import relativedelta
 import uuid
 import os
 import tkinter as tk
@@ -15,6 +16,9 @@ import sys
 import pystray
 from pystray import MenuItem as item, Menu
 import atexit
+import logging
+from logging.handlers import RotatingFileHandler
+import traceback
 
 # --- PATH HELPER FUNCTIONS (FOR PYINSTALLER COMPATIBILITY) ---
 def resource_path(relative_path):
@@ -49,6 +53,79 @@ LOCK_FILE = data_file_path('app.lock') # Lock file also next to exe/script
 INDIVIDUAL_NOTIFICATION_CHECK_INTERVAL_SECONDS = 1 # As per your setting
 NOTIFICATION_WINDOW_MINUTES = 0 # As per your setting (affects check_and_notify_due_reminders old logic, new logic is different)
 
+# Recurring reminder constants
+RECURRENCE_TYPES = {
+    "None": None,
+    "Daily": "daily",
+    "Weekdays": "weekdays",
+    "Weekly": "weekly",
+    "Biweekly": "biweekly",
+    "Monthly": "monthly",
+    "Yearly": "yearly"
+}
+
+# End condition types
+END_CONDITION_TYPES = {
+    "Never": "never",
+    "After": "occurrences",
+    "On Date": "date"
+}
+
+# Maximum number of occurrences for "After" end condition
+MAX_OCCURRENCES = 999
+
+SNOOZE_OPTIONS = {
+    "5 minutes": 5,
+    "10 minutes": 10,
+    "15 minutes": 15,
+    "30 minutes": 30,
+    "1 hour": 60
+}
+
+# --- LOGGING SETUP ---
+def setup_logging():
+    """Set up logging configuration for the application."""
+    log_file = data_file_path("app.log")
+    log_format = '%(asctime)s - %(levelname)s - %(message)s'
+    date_format = '%Y-%m-%d %H:%M:%S'
+    
+    # Create logger
+    logger = logging.getLogger(APP_NAME)
+    logger.setLevel(logging.DEBUG)
+    
+    # Create handlers
+    file_handler = RotatingFileHandler(log_file, maxBytes=1024*1024, backupCount=5)  # 1MB per file, 5 backups
+    console_handler = logging.StreamHandler()
+    
+    # Create formatters and add them to handlers
+    formatter = logging.Formatter(log_format, date_format)
+    file_handler.setFormatter(formatter)
+    console_handler.setFormatter(formatter)
+    
+    # Add handlers to logger
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    
+    return logger
+
+# Initialize logger
+logger = setup_logging()
+
+# --- ERROR HANDLING ---
+def log_error(error_msg, exc_info=None):
+    """Log an error message with optional exception info."""
+    if exc_info:
+        logger.error(f"{error_msg}\n{traceback.format_exc()}")
+    else:
+        logger.error(error_msg)
+
+def log_info(info_msg):
+    """Log an info message."""
+    logger.info(info_msg)
+
+def log_debug(debug_msg):
+    """Log a debug message."""
+    logger.debug(debug_msg)
 
 # --- SINGLE INSTANCE LOCK ---
 def check_single_instance():
@@ -67,11 +144,11 @@ def check_single_instance():
             # For simplicity, we'll stick to file existence, but this can be improved.
             # If process with pid is not running, old lock file should be removed.
             # For now, if file exists, assume another instance is active.
-            print(f"Lock file '{LOCK_FILE}' exists. Another instance might be running or exited uncleanly.")
+            log_info(f"Lock file '{LOCK_FILE}' exists. Another instance might be running or exited uncleanly.")
             messagebox.showwarning(APP_NAME, "Another instance of the application appears to be running.\nIf not, please delete the 'app.lock' file.")
             sys.exit(0) # Exit if lock file exists
         except Exception as e:
-            print(f"Error checking lock file PID: {e}. Assuming another instance or stale lock.")
+            log_error(f"Error checking lock file PID: {e}", exc_info=True)
             # Fallback to simple existence check if PID reading fails
             messagebox.showwarning(APP_NAME, "Could not verify lock file. Another instance might be running.")
             sys.exit(0)
@@ -79,15 +156,16 @@ def check_single_instance():
 
     with open(LOCK_FILE, 'w') as f:
         f.write(str(os.getpid()))
+    log_debug(f"Created lock file with PID {os.getpid()}")
     atexit.register(cleanup_lock_file) # Ensure cleanup on normal exit
 
 def cleanup_lock_file():
     if os.path.exists(LOCK_FILE):
         try:
             os.remove(LOCK_FILE)
-            print("Lock file cleaned up.")
+            log_debug("Lock file cleaned up successfully.")
         except Exception as e:
-            print(f"Error cleaning up lock file: {e}")
+            log_error(f"Error cleaning up lock file: {e}", exc_info=True)
 
 # --- GLOBAL VARIABLES --- (Your existing ones)
 tk_root_window = None
@@ -98,17 +176,24 @@ main_gui_visible = True
 
 # --- DATA HANDLING FUNCTIONS --- (Your existing ones)
 def load_reminders():
-    if not os.path.exists(DATA_FILE): return []
+    if not os.path.exists(DATA_FILE):
+        log_debug(f"Data file {DATA_FILE} does not exist. Returning empty list.")
+        return []
     try:
         with open(DATA_FILE, 'r') as f:
             content = f.read()
-            if not content.strip(): return []
+            if not content.strip():
+                log_debug("Data file is empty. Returning empty list.")
+                return []
             reminders = json.loads(content)
-            if not isinstance(reminders, list): return []
+            if not isinstance(reminders, list):
+                log_error("Data file does not contain a list. Returning empty list.")
+                return []
             reminders.sort(key=lambda r: (str(r.get("date", "")), str(r.get("time", ""))))
+            log_debug(f"Successfully loaded {len(reminders)} reminders.")
             return reminders
     except Exception as e:
-        print(f"Error loading reminders: {e}")
+        log_error(f"Error loading reminders from {DATA_FILE}", exc_info=True)
         messagebox.showerror("Load Error", f"Could not load reminders from {DATA_FILE}.\nError: {e}")
         return []
 
@@ -117,8 +202,9 @@ def save_reminders(reminders):
         reminders.sort(key=lambda r: (str(r.get("date", "")), str(r.get("time", ""))))
         with open(DATA_FILE, 'w') as f:
             json.dump(reminders, f, indent=4)
+        log_debug(f"Successfully saved {len(reminders)} reminders.")
     except Exception as e:
-        print(f"Error saving reminders: {e}")
+        log_error(f"Error saving reminders to {DATA_FILE}", exc_info=True)
         messagebox.showerror("Save Error", f"Could not save reminders to {DATA_FILE}.\nError: {e}")
 
 def load_app_config():
@@ -129,7 +215,7 @@ def load_app_config():
             if not content.strip(): return {}
             return json.loads(content)
     except Exception as e:
-        print(f"Error loading app config: {e}")
+        log_error(f"Error loading app config: {e}")
         return {}
 
 def save_app_config(config_data):
@@ -137,7 +223,7 @@ def save_app_config(config_data):
         with open(CONFIG_FILE, 'w') as f:
             json.dump(config_data, f, indent=4)
     except Exception as e:
-        print(f"Error saving app config: {e}")
+        log_error(f"Error saving app config: {e}")
 
 # --- TIME FORMATTING --- (Your existing one)
 def format_time_to_ampm(time_str_24h):
@@ -149,27 +235,48 @@ def format_time_to_ampm(time_str_24h):
         return time_str_24h
 
 # --- NOTIFICATION & SCHEDULER --- (Your existing, with your check_and_notify_due_reminders logic)
-def show_individual_reminder_popup_thread_safe(title, reminder_time_24h):
+def show_individual_reminder_popup_thread_safe(title, reminder_time_24h, reminder_id=None):
     if tk_root_window:
-        tk_root_window.after(0, lambda t=title, rt=reminder_time_24h: actual_show_individual_popup(t, rt))
+        tk_root_window.after(0, lambda t=title, rt=reminder_time_24h, rid=reminder_id: 
+                           actual_show_individual_popup(t, rt, rid))
 
-def actual_show_individual_popup(reminder_title, reminder_time_24h):
+def actual_show_individual_popup(reminder_title, reminder_time_24h, reminder_id=None):
     try:
         popup = tk.Toplevel(tk_root_window)
         popup.title("Reminder Due!")
         popup.attributes('-topmost', True)
-        app_icon_photo = getattr(app_instance_ref, 'app_icon_photo', None) # Use a clearly named attribute
+        app_icon_photo = getattr(app_instance_ref, 'app_icon_photo', None)
         if app_icon_photo:
-             popup.iconphoto(True, app_icon_photo)
+            popup.iconphoto(True, app_icon_photo)
         
         formatted_time_ampm = format_time_to_ampm(reminder_time_24h)
         label_text = f"Reminder: {reminder_title}\nTime: {formatted_time_ampm}"
         
         label = ttk.Label(popup, text=label_text, padding="20", wraplength=300, justify=tk.CENTER)
         label.pack(pady=10, padx=10)
-        ttk.Button(popup, text="OK", command=popup.destroy).pack(pady=10)
-        popup.lift(); popup.focus_force()
-    except Exception as e: print(f"Error in actual_show_individual_popup: {e}")
+
+        # Add buttons frame
+        button_frame = ttk.Frame(popup)
+        button_frame.pack(pady=10)
+
+        # Snooze button with dropdown
+        if reminder_id:
+            snooze_var = tk.StringVar(value="5 minutes")
+            snooze_menu = ttk.OptionMenu(button_frame, snooze_var, "5 minutes", *SNOOZE_OPTIONS.keys())
+            snooze_menu.pack(side=tk.LEFT, padx=5)
+            
+            def do_snooze():
+                minutes = SNOOZE_OPTIONS[snooze_var.get()]
+                if snooze_reminder(reminder_id, minutes):
+                    popup.destroy()
+            
+            ttk.Button(button_frame, text="Snooze", command=do_snooze).pack(side=tk.LEFT, padx=5)
+
+        ttk.Button(button_frame, text="OK", command=popup.destroy).pack(side=tk.LEFT, padx=5)
+        popup.lift()
+        popup.focus_force()
+    except Exception as e:
+        log_error(f"Error in actual_show_individual_popup: {e}")
 
 def mark_reminder_as_notified(reminder_id):
     reminders = load_reminders()
@@ -177,20 +284,139 @@ def mark_reminder_as_notified(reminder_id):
         if r.get("id") == reminder_id: r["notified_individually"] = True; break
     save_reminders(reminders)
 
-def check_and_notify_due_reminders(): # Your version of this logic
+def calculate_next_recurrence(reminder):
+    """Calculate the next occurrence date for a recurring reminder."""
+    if not reminder.get("recurrence_type"):
+        return None
+    
+    current_date = datetime.strptime(reminder["date"], "%Y-%m-%d").date()
+    today = date.today()
+    
+    if current_date < today:
+        current_date = today
+    
+    recurrence_type = reminder["recurrence_type"]
+    
+    if recurrence_type == "daily":
+        return (current_date + timedelta(days=1)).strftime("%Y-%m-%d")
+    elif recurrence_type == "weekdays":
+        next_date = current_date + timedelta(days=1)
+        # Skip weekends
+        while next_date.weekday() >= 5:  # 5 is Saturday, 6 is Sunday
+            next_date += timedelta(days=1)
+        return next_date.strftime("%Y-%m-%d")
+    elif recurrence_type == "weekly":
+        return (current_date + timedelta(days=7)).strftime("%Y-%m-%d")
+    elif recurrence_type == "biweekly":
+        return (current_date + timedelta(days=14)).strftime("%Y-%m-%d")
+    elif recurrence_type == "monthly":
+        # Use relativedelta for robust month calculations
+        next_month_date = current_date + relativedelta(months=1)
+        return next_month_date.strftime("%Y-%m-%d")
+    elif recurrence_type == "yearly":
+        # Use relativedelta for consistent year calculations
+        next_year_date = current_date + relativedelta(years=1)
+        return next_year_date.strftime("%Y-%m-%d")
+    return None
+
+def snooze_reminder(reminder_id, minutes):
+    """Snooze a reminder for the specified number of minutes."""
     reminders = load_reminders()
-    today_str = date.today().strftime("%Y-%m-%d")
-    now_dt = datetime.now()
-    for r in reminders:
-        if r.get("notified_individually", False): continue
-        if r.get("date") == today_str and r.get("time"):
-            try:
-                r_dt = datetime.strptime(f"{today_str} {r['time']}", "%Y-%m-%d %H:%M")
-                diff_seconds = (now_dt - r_dt).total_seconds()
-                if 0 <= diff_seconds < 10 : # Your 10-second window
-                    show_individual_reminder_popup_thread_safe(r.get("title"), r.get("time"))
-                    mark_reminder_as_notified(r.get("id"))
-            except ValueError: pass
+    for reminder in reminders:
+        if reminder.get("id") == reminder_id:
+            reminder["notified_individually"] = False
+            # Update the time to current time + snooze minutes
+            current_time = datetime.now()
+            snooze_time = current_time + timedelta(minutes=minutes)
+            reminder["time"] = snooze_time.strftime("%H:%M")
+            reminder["date"] = snooze_time.strftime("%Y-%m-%d")
+            save_reminders(reminders)
+            return True
+    return False
+
+def check_and_notify_due_reminders():
+    """Check for due reminders and notify if needed."""
+    try:
+        reminders = load_reminders()
+        current_time = datetime.now()
+        updated_reminders = []
+        data_changed = False
+
+        for reminder in reminders:
+            reminder_time = datetime.strptime(f"{reminder['date']} {reminder['time']}", "%Y-%m-%d %H:%M")
+            
+            # Skip if already notified
+            if reminder.get("notified_individually", False):
+                updated_reminders.append(reminder)
+                continue
+
+            # Check if reminder is due
+            if reminder_time <= current_time:
+                # Show notification for current instance using the correct function
+                show_individual_reminder_popup_thread_safe(
+                    reminder.get("title"),
+                    reminder.get("time"),
+                    reminder.get("id")
+                )
+                reminder["notified_individually"] = True
+                data_changed = True
+
+                # Handle recurring reminders
+                if reminder.get("recurrence_type") is not None:
+                    # Check end conditions
+                    end_type = reminder.get("recurrence_end_type", "never")
+                    series_ended = False
+
+                    if end_type == "occurrences":
+                        current_count = reminder.get("recurrence_current_count", 0)
+                        max_occurrences = reminder.get("recurrence_end_value")
+                        if current_count >= max_occurrences:
+                            series_ended = True
+                        else:
+                            reminder["recurrence_current_count"] = current_count + 1
+
+                    # Calculate next date before checking date-based end condition
+                    next_date_str = calculate_next_recurrence(reminder)
+                    
+                    # Check date-based end condition using the next calculated date
+                    if not series_ended and end_type == "date":
+                        recurrence_end_date_str = reminder.get("recurrence_end_value")
+                        if recurrence_end_date_str:
+                            try:
+                                recurrence_end_date_obj = datetime.strptime(recurrence_end_date_str, "%Y-%m-%d").date()
+                                next_calculated_date_obj = datetime.strptime(next_date_str, "%Y-%m-%d").date()
+                                
+                                if next_calculated_date_obj > recurrence_end_date_obj:
+                                    log_debug(f"Next calculated date {next_date_str} is past end date {recurrence_end_date_str}. Series ends for {reminder.get('id')}")
+                                    series_ended = True
+                            except (ValueError, TypeError) as e_date_conv:
+                                log_error(f"Invalid end date format '{recurrence_end_date_str}' or next date '{next_date_str}' for reminder ID {reminder.get('id')}", exc_info=True)
+                                series_ended = True
+
+                    # Create next occurrence if series hasn't ended
+                    if not series_ended and next_date_str:
+                        new_reminder = reminder.copy()
+                        new_reminder["id"] = str(uuid.uuid4())
+                        new_reminder["date"] = next_date_str
+                        new_reminder["notified_individually"] = False
+                        # Preserve current count for occurrences type
+                        if end_type == "occurrences":
+                            new_reminder["recurrence_current_count"] = reminder["recurrence_current_count"]
+                        updated_reminders.append(new_reminder)
+                        data_changed = True
+
+                # Add the original (now notified) reminder
+                updated_reminders.append(reminder)
+            else:
+                # Not due yet, keep as is
+                updated_reminders.append(reminder)
+
+        # Save changes if any were made
+        if data_changed:
+            save_reminders(updated_reminders)
+
+    except Exception as e:
+        log_error(f"Error checking due reminders: {e}", exc_info=True)
 
 def delete_past_reminders():
     """Delete reminders from past dates."""
@@ -204,30 +430,31 @@ def delete_past_reminders():
             reminder_date = datetime.strptime(reminder.get("date", ""), "%Y-%m-%d").date()
             if reminder_date < today:
                 deleted_count += 1
+                log_debug(f"Deleting past reminder: {reminder.get('title')} ({reminder.get('date')})")
                 continue
             updated_reminders.append(reminder)
         except ValueError:
-            # If date is invalid, keep the reminder
+            log_error(f"Invalid date format in reminder: {reminder}", exc_info=True)
             updated_reminders.append(reminder)
     
     if deleted_count > 0:
         save_reminders(updated_reminders)
-        print(f"Deleted {deleted_count} past reminders.")
+        log_info(f"Deleted {deleted_count} past reminders.")
 
 def run_scheduler():
-    print("Scheduler thread started.")
+    log_info("Scheduler thread started.")
     schedule.every(INDIVIDUAL_NOTIFICATION_CHECK_INTERVAL_SECONDS).seconds.do(check_and_notify_due_reminders)
-    # Add daily cleanup of past reminders at midnight
     schedule.every().day.at("00:00").do(delete_past_reminders)
     while not scheduler_stop_event.is_set():
-        schedule.run_pending(); py_time.sleep(1)
-    print("Scheduler thread stopped.")
+        schedule.run_pending()
+        py_time.sleep(1)
+    log_info("Scheduler thread stopped.")
 
 # --- GUI HELPER & LOGIC FUNCTIONS --- (Your existing display_reminders_popup)
 def display_reminders_popup(reminders_list, title="Today's Upcoming Reminders", parent_window=None):
     temp_root_for_display = None
     if not parent_window or not parent_window.winfo_exists():
-        print("display_reminders_popup: No valid parent_window, creating temporary root.")
+        log_debug("display_reminders_popup: No valid parent_window, creating temporary root.")
         temp_root_for_display = tk.Tk()
         temp_root_for_display.withdraw()
     
@@ -314,7 +541,7 @@ def add_reminder_action_from_tray(icon=None, menu_item=None):
     if tk_root_window and app_instance_ref: tk_root_window.after(0, app_instance_ref.open_add_reminder_window)
 def quit_application_action(icon=None, menu_item=None):
     global tk_root_window, scheduler_stop_event, tray_icon_object
-    print("Quit action initiated.")
+    log_info("Quit action initiated.")
     scheduler_stop_event.set()
     if tray_icon_object: tray_icon_object.stop()
     if tk_root_window: tk_root_window.after(0, tk_root_window.quit)
@@ -322,99 +549,158 @@ def quit_application_action(icon=None, menu_item=None):
 def on_main_window_close_button():
     global tk_root_window, main_gui_visible
     if tk_root_window: tk_root_window.withdraw(); main_gui_visible = False
-    print("App hidden to system tray.")
+    log_info("App hidden to system tray.")
 
 # --- GUI APPLICATION CLASSES ---
 class ReminderApp:
     def __init__(self, root):
-        global app_instance_ref; app_instance_ref = self # Assign global reference
+        global app_instance_ref; app_instance_ref = self
         self.root = root
         self.root.title(APP_NAME)
         self.root.protocol("WM_DELETE_WINDOW", on_main_window_close_button)
-        self.app_icon_photo = None # Store PhotoImage here to prevent garbage collection
+        self.app_icon_photo = None
 
         try:
             img = Image.open(LOGO_FILE)
             self.app_icon_photo = ImageTk.PhotoImage(img)
             self.root.iconphoto(True, self.app_icon_photo)
         except Exception as e:
-            print(f"Warn: App logo '{LOGO_FILE}' not found/loadable: {e}")
+            log_error(f"Warn: App logo '{LOGO_FILE}' not found/loadable: {e}")
             self.app_icon_photo = None
         
-        # --- Your UI structure from the provided code ---
         style = ttk.Style()
         style.configure("Treeview.Heading", font=('Helvetica', 10, 'bold'))
 
         main_frame = ttk.Frame(self.root, padding="10")
         main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
 
+        # Button frame
         button_frame = ttk.Frame(main_frame)
-        button_frame.grid(row=0, column=0, columnspan=2, pady=10, sticky=tk.EW) # Sticky EW
+        button_frame.grid(row=0, column=0, columnspan=2, pady=10, sticky=tk.EW)
 
         ttk.Button(button_frame, text="Add", command=self.open_add_reminder_window).pack(side=tk.LEFT, padx=5)
         ttk.Button(button_frame, text="Update", command=self.open_update_reminder_window).pack(side=tk.LEFT, padx=5)
         ttk.Button(button_frame, text="Delete", command=self.delete_selected_reminder).pack(side=tk.LEFT, padx=5)
         ttk.Button(button_frame, text="Refresh", command=self.populate_reminders_list).pack(side=tk.LEFT, padx=5)
-        
-        # Centering the title label using grid
+
+        # Filter frame
+        filter_frame = ttk.Frame(main_frame)
+        filter_frame.grid(row=1, column=0, columnspan=2, pady=5, sticky=tk.EW)
+
+        ttk.Label(filter_frame, text="Filter:").pack(side=tk.LEFT, padx=5)
+        self.filter_var = tk.StringVar(value="All")
+        filter_combo = ttk.Combobox(filter_frame, textvariable=self.filter_var,
+                                   values=["All", "Today", "Upcoming", "Past", "Recurring"],
+                                   state="readonly", width=10)
+        filter_combo.pack(side=tk.LEFT, padx=5)
+        filter_combo.bind('<<ComboboxSelected>>', lambda e: self.apply_filters())
+
+        ttk.Label(filter_frame, text="Sort by:").pack(side=tk.LEFT, padx=5)
+        self.sort_var = tk.StringVar(value="Date")
+        sort_combo = ttk.Combobox(filter_frame, textvariable=self.sort_var,
+                                 values=["Date", "Time", "Title"],
+                                 state="readonly", width=10)
+        sort_combo.pack(side=tk.LEFT, padx=5)
+        sort_combo.bind('<<ComboboxSelected>>', lambda e: self.apply_filters())
+
+        # Title label
         self.title_label = ttk.Label(main_frame, text="All Reminders", font=("Helvetica", 16, "bold"), anchor="center")
-        self.title_label.grid(row=1, column=0, columnspan=2, pady=(5,0), sticky=tk.EW)
+        self.title_label.grid(row=2, column=0, columnspan=2, pady=(5,0), sticky=tk.EW)
 
-
-        self.tree = ttk.Treeview(main_frame, columns=("#", "Title", "Date", "Time"), show="headings") # Added "#"
-        self.tree.heading("#", text="#", anchor="center") # Added "#"
-        self.tree.column("#", width=40, minwidth=30, stretch=tk.NO, anchor="center") # Added "#"
+        # Treeview
+        self.tree = ttk.Treeview(main_frame, columns=("#", "Title", "Date", "Time", "Repeat"), show="headings")
+        self.tree.heading("#", text="#", anchor="center")
+        self.tree.column("#", width=40, minwidth=30, stretch=tk.NO, anchor="center")
 
         self.tree.heading("Title", text="Reminder Name")
-        self.tree.column("Title", width=300, minwidth=150)
+        self.tree.column("Title", width=250, minwidth=150)
+        
         self.tree.heading("Date", text="Date", anchor="center")
         self.tree.column("Date", width=100, minwidth=80, anchor="center")
+        
         self.tree.heading("Time", text="Time", anchor="center")
         self.tree.column("Time", width=100, minwidth=80, anchor="center")
-        self.tree.grid(row=2, column=0, sticky=(tk.W, tk.E, tk.N, tk.S)) # Changed row
+        
+        self.tree.heading("Repeat", text="Repeat", anchor="center")
+        self.tree.column("Repeat", width=80, minwidth=60, anchor="center")
 
+        self.tree.grid(row=3, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+
+        # Scrollbar
         scrollbar = ttk.Scrollbar(main_frame, orient=tk.VERTICAL, command=self.tree.yview)
-        scrollbar.grid(row=2, column=1, sticky=(tk.N, tk.S)) # Changed row, made column 1
+        scrollbar.grid(row=3, column=1, sticky=(tk.N, tk.S))
         self.tree.configure(yscrollcommand=scrollbar.set)
 
+        # Configure grid weights
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
-        main_frame.columnconfigure(0, weight=1) # Treeview column
-        main_frame.columnconfigure(1, weight=0) # Scrollbar column
-        main_frame.rowconfigure(2, weight=1)    # Treeview row (changed from 1 to 2)
+        main_frame.columnconfigure(0, weight=1)
+        main_frame.columnconfigure(1, weight=0)
+        main_frame.rowconfigure(3, weight=1)
 
         self.populate_reminders_list()
-        # self.setup_system_tray() # Moved to __main__ to avoid issues with multiple tray icons on re-show
+        if main_gui_visible:
+            self.show_app_init_reminders_popup()
+
+    def apply_filters(self):
+        """Apply current filter and sort settings to the reminders list."""
+        reminders = load_reminders()
+        today = date.today()
+        today_str = today.strftime("%Y-%m-%d")
         
-        # Only show this pop-up if not started hidden (i.e., user launched normally)
-        # And perhaps only if no other instance is just showing the startup_check pop-up.
-        # For simplicity, let's tie it to main_gui_visible being True initially.
-        if main_gui_visible: # This global is set in __main__
-             self.show_app_init_reminders_popup()
+        # Apply filter
+        filter_type = self.filter_var.get()
+        if filter_type == "Today":
+            reminders = [r for r in reminders if r.get("date") == today_str]
+        elif filter_type == "Upcoming":
+            reminders = [r for r in reminders if r.get("date") > today_str]
+        elif filter_type == "Past":
+            reminders = [r for r in reminders if r.get("date") < today_str]
+        elif filter_type == "Recurring":
+            reminders = [r for r in reminders if r.get("recurrence_type")]
 
+        # Apply sort
+        sort_by = self.sort_var.get()
+        if sort_by == "Date":
+            reminders.sort(key=lambda r: (r.get("date", ""), r.get("time", "")))
+        elif sort_by == "Time":
+            reminders.sort(key=lambda r: (r.get("time", ""), r.get("date", "")))
+        elif sort_by == "Title":
+            reminders.sort(key=lambda r: r.get("title", ""))
 
-    def show_app_init_reminders_popup(self): # Renamed from show_startup_reminders for clarity
-        reminders, title_prefix = get_upcoming_todays_reminders() # Now returns a tuple
+        # Update the tree
+        for i in self.tree.get_children():
+            self.tree.delete(i)
+
+        for idx, reminder in enumerate(reminders):
+            formatted_time_ampm = format_time_to_ampm(reminder.get('time', 'N/A'))
+            recurrence_type = reminder.get('recurrence_type', 'None')
+            if recurrence_type:
+                recurrence_display = recurrence_type.capitalize()
+            else:
+                recurrence_display = "None"
+            
+            self.tree.insert("", tk.END, iid=reminder.get('id'), values=(
+                idx + 1,
+                reminder.get('title', 'N/A'),
+                reminder.get('date', 'N/A'),
+                formatted_time_ampm,
+                recurrence_display
+            ))
+
+    def populate_reminders_list(self):
+        """Populate the reminders list with current filter and sort settings."""
+        self.apply_filters()
+
+    def show_app_init_reminders_popup(self):
+        reminders, title_prefix = get_upcoming_todays_reminders()
         if reminders:
             display_reminders_popup(reminders, f"{title_prefix} Upcoming Reminders", self.root)
 
-    def populate_reminders_list(self):
-        for i in self.tree.get_children(): self.tree.delete(i)
-        all_reminders = load_reminders()
-        if not all_reminders: return
-        for idx, reminder in enumerate(all_reminders):
-            formatted_time_ampm = format_time_to_ampm(reminder.get('time', 'N/A'))
-            self.tree.insert("", tk.END, iid=reminder.get('id'), values=(
-                idx + 1, # For the '#' column
-                reminder.get('title', 'N/A'),
-                reminder.get('date', 'N/A'),
-                formatted_time_ampm
-            ))
-
-    def open_add_reminder_window(self): AddReminderWindow(self.root, self)
+    def open_add_reminder_window(self):
+        AddReminderWindow(self.root, self)
         
     def open_update_reminder_window(self):
-        # print("DEBUG: NOW INSIDE THE CORRECT open_update_reminder_window METHOD!")
         selected_item_iids = self.tree.selection()
         if not selected_item_iids:
             messagebox.showwarning("No Selection", "Please select a reminder to update.", parent=self.root)
@@ -428,9 +714,9 @@ class ReminderApp:
         if reminder_data_to_edit is None:
             messagebox.showerror("Error", "Could not find selected reminder. Please refresh.", parent=self.root)
             return
-        EditReminderWindow(parent_root=self.root, main_app_ref=self, reminder_to_edit=reminder_data_to_edit)
+        EditReminderWindow(parent_root=self.root, reminder=reminder_data_to_edit, main_app_ref=self)
     
-    def delete_selected_reminder(self): # Your existing, seems okay
+    def delete_selected_reminder(self):
         selected_item_iids = self.tree.selection()
         if not selected_item_iids:
             messagebox.showwarning("No Selection", "Please select a reminder to delete.", parent=self.root)
@@ -449,13 +735,13 @@ class ReminderApp:
             self.populate_reminders_list()
             messagebox.showinfo("Deleted", "Reminder deleted successfully.", parent=self.root)
 
-class AddReminderWindow: # Your existing, seems okay with AM/PM
+class AddReminderWindow:
     def __init__(self, parent_root, main_app_ref):
         self.parent = parent_root
         self.main_app = main_app_ref
         self.add_window = tk.Toplevel(self.parent)
         self.add_window.title("Add New Reminder")
-        self.add_window.geometry("450x550")
+        self.add_window.geometry("450x700")  # Increased height for new controls
         self.add_window.transient(self.parent)
         self.add_window.grab_set()
         app_icon_photo = getattr(self.main_app, 'app_icon_photo', None)
@@ -463,144 +749,516 @@ class AddReminderWindow: # Your existing, seems okay with AM/PM
 
         form_frame = ttk.Frame(self.add_window, padding="15")
         form_frame.pack(fill=tk.BOTH, expand=True)
+
+        # Title
         ttk.Label(form_frame, text="Title:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
         self.title_entry = ttk.Entry(form_frame, width=40)
         self.title_entry.grid(row=0, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
+
+        # Date
         ttk.Label(form_frame, text="Date:").grid(row=1, column=0, sticky="nw", padx=5, pady=(10,5))
         self.cal = Calendar(form_frame, selectmode='day', date_pattern='yyyy-mm-dd', font="Arial 9")
         self.cal.grid(row=1, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
         self.cal.selection_set(date.today())
+
+        # Time with enhanced input
         ttk.Label(form_frame, text="Time:").grid(row=2, column=0, sticky="w", padx=5, pady=(10,5))
         time_input_frame = ttk.Frame(form_frame)
         time_input_frame.grid(row=2, column=1, columnspan=2, sticky="w", padx=5, pady=5)
+        
         current_dt = datetime.now()
-        self.hour_spinbox = ttk.Spinbox(time_input_frame, from_=1, to=12, width=3, format="%02.0f", wrap=True)
-        self.hour_spinbox.pack(side=tk.LEFT); self.hour_spinbox.set(f"{int(current_dt.strftime('%I')):02}")
+        self.hour_spinbox = ttk.Spinbox(time_input_frame, from_=1, to=12, width=3, 
+                                      format="%02.0f", wrap=True,
+                                      command=self.validate_time_input)
+        self.hour_spinbox.pack(side=tk.LEFT)
+        self.hour_spinbox.set(f"{int(current_dt.strftime('%I')):02}")
+        
         ttk.Label(time_input_frame, text=":").pack(side=tk.LEFT, padx=2)
-        self.minute_spinbox = ttk.Spinbox(time_input_frame, from_=0, to=59, width=3, format="%02.0f", wrap=True)
-        self.minute_spinbox.pack(side=tk.LEFT); self.minute_spinbox.set(current_dt.strftime("%M"))
+        
+        self.minute_spinbox = ttk.Spinbox(time_input_frame, from_=0, to=59, width=3, 
+                                        format="%02.0f", wrap=True,
+                                        command=self.validate_time_input)
+        self.minute_spinbox.pack(side=tk.LEFT)
+        self.minute_spinbox.set(current_dt.strftime("%M"))
+        
         self.ampm_var = tk.StringVar(value=current_dt.strftime("%p"))
-        self.ampm_combobox = ttk.Combobox(time_input_frame, textvariable=self.ampm_var, values=["AM", "PM"], width=3, state="readonly")
+        self.ampm_combobox = ttk.Combobox(time_input_frame, textvariable=self.ampm_var, 
+                                         values=["AM", "PM"], width=3, state="readonly")
         self.ampm_combobox.pack(side=tk.LEFT, padx=(5,0))
-        ttk.Button(form_frame, text="Save Reminder", command=self.save_new_reminder).grid(row=3, column=0, columnspan=3, pady=20,ipady=4)
-        form_frame.columnconfigure(1, weight=1); self.title_entry.focus_set()
+        
+        # Add quick time buttons
+        quick_time_frame = ttk.Frame(time_input_frame)
+        quick_time_frame.pack(side=tk.TOP, pady=(5,0))
+        
+        quick_times = ["Now", "Morning", "Noon", "Evening"]
+        for time_label in quick_times:
+            ttk.Button(quick_time_frame, text=time_label, width=8,
+                      command=lambda t=time_label: self.set_quick_time(t)).pack(side=tk.LEFT, padx=2)
 
-    def save_new_reminder(self): # Your existing save logic for new reminders
+        # Enhanced Recurrence Frame
+        ttk.Label(form_frame, text="Repeat:").grid(row=3, column=0, sticky="w", padx=5, pady=(10,5))
+        recurrence_frame = ttk.Frame(form_frame)
+        recurrence_frame.grid(row=3, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
+        
+        self.recurrence_var = tk.StringVar(value="None")
+        self.recurrence_combobox = ttk.Combobox(recurrence_frame, textvariable=self.recurrence_var,
+                                               values=list(RECURRENCE_TYPES.keys()), state="readonly")
+        self.recurrence_combobox.pack(side=tk.LEFT, padx=(0,5))
+        
+        # Add recurrence info label
+        self.recurrence_info = ttk.Label(recurrence_frame, text="", font=("Helvetica", 8))
+        self.recurrence_info.pack(side=tk.LEFT)
+        
+        # Bind to update info when selection changes
+        self.recurrence_combobox.bind('<<ComboboxSelected>>', self.update_recurrence_info)
+
+        # End Condition Frame
+        ttk.Label(form_frame, text="Ends:").grid(row=4, column=0, sticky="w", padx=5, pady=(10,5))
+        end_condition_frame = ttk.Frame(form_frame)
+        end_condition_frame.grid(row=4, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
+        
+        self.end_condition_var = tk.StringVar(value="Never")
+        self.end_condition_combobox = ttk.Combobox(end_condition_frame, textvariable=self.end_condition_var,
+                                                  values=list(END_CONDITION_TYPES.keys()), state="readonly")
+        self.end_condition_combobox.pack(side=tk.LEFT, padx=(0,5))
+        
+        # Bind to show/hide end condition inputs
+        self.end_condition_combobox.bind('<<ComboboxSelected>>', self.update_end_condition_inputs)
+        
+        # Frame for end condition specific inputs
+        self.end_condition_inputs_frame = ttk.Frame(end_condition_frame)
+        self.end_condition_inputs_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        
+        # Occurrences input with default value for new reminder
+        self.occurrences_var = tk.StringVar(value="1")
+        self.occurrences_spinbox = ttk.Spinbox(self.end_condition_inputs_frame, from_=1, to=MAX_OCCURRENCES,
+                                             textvariable=self.occurrences_var, width=5)
+        
+        # Create the "times" label once
+        self.occurrences_label = ttk.Label(self.end_condition_inputs_frame, text="times")
+        
+        # End date calendar
+        self.end_date_cal = Calendar(self.end_condition_inputs_frame, selectmode='day', 
+                                   date_pattern='yyyy-mm-dd', font="Arial 9")
+        
+        # Initially hide end condition inputs
+        self.update_end_condition_inputs()
+
+        # Save button
+        ttk.Button(form_frame, text="Save Reminder", command=self.save_new_reminder).grid(
+            row=5, column=0, columnspan=3, pady=20, ipady=4)
+        
+        form_frame.columnconfigure(1, weight=1)
+        self.title_entry.focus_set()
+
+    def update_end_condition_inputs(self, event=None):
+        """Show/hide end condition specific inputs based on selection."""
+        # Hide all inputs first
+        self.occurrences_spinbox.pack_forget()
+        self.occurrences_label.pack_forget()
+        self.end_date_cal.pack_forget()
+        
+        # Show relevant input based on selection
+        end_type = self.end_condition_var.get()
+        if end_type == "After":
+            self.occurrences_spinbox.pack(side=tk.LEFT, padx=(0,5))
+            self.occurrences_label.pack(side=tk.LEFT)
+        elif end_type == "On Date":
+            self.end_date_cal.pack(side=tk.LEFT, padx=(5,0))
+            # Ensure end date is after start date
+            start_date = datetime.strptime(self.cal.get_date(), "%Y-%m-%d").date()
+            self.end_date_cal.selection_set(start_date + timedelta(days=1))
+
+    def save_new_reminder(self):
         title = self.title_entry.get().strip()
         selected_date_str = self.cal.get_date()
-        hour_12_str, minute_str, ampm_val = self.hour_spinbox.get().strip(), self.minute_spinbox.get().strip(), self.ampm_var.get()
-        if not title: messagebox.showerror("Input Error", "Title cannot be empty.", parent=self.add_window); return
-        if not hour_12_str.isdigit() or not minute_str.isdigit(): messagebox.showerror("Input Error", "Hour/Minute invalid.", parent=self.add_window); return
+        hour_12_str = self.hour_spinbox.get().strip()
+        minute_str = self.minute_spinbox.get().strip()
+        ampm_val = self.ampm_var.get()
+        recurrence_type = RECURRENCE_TYPES[self.recurrence_var.get()]
+        end_condition_type = END_CONDITION_TYPES[self.end_condition_var.get()]
+
+        if not title:
+            messagebox.showerror("Input Error", "Title cannot be empty.", parent=self.add_window)
+            return
+
+        if not hour_12_str.isdigit() or not minute_str.isdigit():
+            messagebox.showerror("Input Error", "Hour/Minute must be numeric.", parent=self.add_window)
+            return
+
         hour_12_int, minute_int = int(hour_12_str), int(minute_str)
-        if not (1 <= hour_12_int <= 12 and 0 <= minute_int <= 59): messagebox.showerror("Input Error", "Hour/Minute out of range.", parent=self.add_window); return
+        if not (1 <= hour_12_int <= 12 and 0 <= minute_int <= 59):
+            messagebox.showerror("Input Error", "Hour/Minute out of range.", parent=self.add_window)
+            return
+
         try:
             time_obj_24h = datetime.strptime(f"{hour_12_int:02}:{minute_int:02} {ampm_val}", "%I:%M %p")
             time_str_24h_to_save = time_obj_24h.strftime("%H:%M")
-        except ValueError: messagebox.showerror("Input Error", "Invalid time format.", parent=self.add_window); return
-        new_reminder = {"id": str(uuid.uuid4()), "title": title, "date": selected_date_str, "time": time_str_24h_to_save, "notified_individually": False}
-        reminders = load_reminders(); reminders.append(new_reminder); save_reminders(reminders)
-        messagebox.showinfo("Success", "Reminder added!", parent=self.add_window)
-        self.main_app.populate_reminders_list(); self.add_window.destroy()
+        except ValueError as e:
+            log_error(f"Time conversion error: {e}", exc_info=True)
+            messagebox.showerror("Input Error", "Invalid time format.", parent=self.add_window)
+            return
 
-class EditReminderWindow: # Your existing, with placeholder save
-    def __init__(self, parent_root, main_app_ref, reminder_to_edit):
-        self.parent = parent_root; self.main_app = main_app_ref; self.reminder_to_edit = reminder_to_edit
-        self.edit_window = tk.Toplevel(self.parent); self.edit_window.title("Edit Reminder")
-        self.edit_window.geometry("450x550"); self.edit_window.transient(self.parent); self.edit_window.grab_set()
+        # Validate end conditions
+        if end_condition_type == "occurrences":
+            try:
+                occurrences = int(self.occurrences_var.get())
+                if not (1 <= occurrences <= MAX_OCCURRENCES):
+                    messagebox.showerror("Input Error", f"Number of occurrences must be between 1 and {MAX_OCCURRENCES}.", 
+                                       parent=self.add_window)
+                    return
+            except ValueError:
+                messagebox.showerror("Input Error", "Number of occurrences must be a valid number.", 
+                                   parent=self.add_window)
+                return
+        elif end_condition_type == "date":
+            end_date = datetime.strptime(self.end_date_cal.get_date(), "%Y-%m-%d").date()
+            start_date = datetime.strptime(selected_date_str, "%Y-%m-%d").date()
+            if end_date <= start_date:
+                messagebox.showerror("Input Error", "End date must be after start date.", 
+                                   parent=self.add_window)
+                return
+
+        new_reminder = {
+            "id": str(uuid.uuid4()),
+            "title": title,
+            "date": selected_date_str,
+            "time": time_str_24h_to_save,
+            "notified_individually": False,
+            "recurrence_type": recurrence_type,
+            "recurrence_end_type": end_condition_type,
+            "recurrence_end_value": (
+                int(self.occurrences_var.get()) if end_condition_type == "occurrences"
+                else self.end_date_cal.get_date() if end_condition_type == "date"
+                else None
+            ),
+            "recurrence_current_count": 0 if end_condition_type == "occurrences" else None,
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+
+        reminders = load_reminders()
+        reminders.append(new_reminder)
+        save_reminders(reminders)
+        messagebox.showinfo("Success", "Reminder added!", parent=self.add_window)
+        self.main_app.populate_reminders_list()
+        self.add_window.destroy()
+
+class EditReminderWindow:
+    def __init__(self, parent_root, reminder, main_app_ref):
+        self.parent = parent_root
+        self.reminder = reminder
+        self.main_app = main_app_ref
+        self.edit_window = tk.Toplevel(self.parent)
+        self.edit_window.title("Edit Reminder")
+        self.edit_window.geometry("450x700")  # Increased height for new controls
+        self.edit_window.transient(self.parent)
+        self.edit_window.grab_set()
         app_icon_photo = getattr(self.main_app, 'app_icon_photo', None)
         if app_icon_photo: self.edit_window.iconphoto(True, app_icon_photo)
 
-        form_frame = ttk.Frame(self.edit_window, padding="15"); form_frame.pack(fill=tk.BOTH, expand=True)
+        form_frame = ttk.Frame(self.edit_window, padding="15")
+        form_frame.pack(fill=tk.BOTH, expand=True)
+
+        # Title
         ttk.Label(form_frame, text="Title:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
         self.title_entry = ttk.Entry(form_frame, width=40)
         self.title_entry.grid(row=0, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
-        self.title_entry.insert(0, self.reminder_to_edit.get("title", ""))
+        self.title_entry.insert(0, reminder["title"])
+
+        # Date
         ttk.Label(form_frame, text="Date:").grid(row=1, column=0, sticky="nw", padx=5, pady=(10,5))
         self.cal = Calendar(form_frame, selectmode='day', date_pattern='yyyy-mm-dd', font="Arial 9")
         self.cal.grid(row=1, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
-        try: self.cal.selection_set(datetime.strptime(self.reminder_to_edit.get("date"), "%Y-%m-%d").date())
-        except: self.cal.selection_set(date.today())
+        self.cal.selection_set(reminder["date"])
+
+        # Time with enhanced input
         ttk.Label(form_frame, text="Time:").grid(row=2, column=0, sticky="w", padx=5, pady=(10,5))
         time_input_frame = ttk.Frame(form_frame)
         time_input_frame.grid(row=2, column=1, columnspan=2, sticky="w", padx=5, pady=5)
-        try:
-            time_obj = datetime.strptime(self.reminder_to_edit.get("time", "12:00"), "%H:%M")
-            h, m, ampm = time_obj.strftime("%I"), time_obj.strftime("%M"), time_obj.strftime("%p")
-        except: h, m, ampm = datetime.now().strftime("%I"), datetime.now().strftime("%M"), datetime.now().strftime("%p")
-        self.hour_spinbox = ttk.Spinbox(time_input_frame, from_=1, to=12, width=3, format="%02.0f", wrap=True)
-        self.hour_spinbox.pack(side=tk.LEFT); self.hour_spinbox.set(h)
+        
+        # Parse existing time
+        time_obj = datetime.strptime(reminder["time"], "%H:%M")
+        hour_12 = int(time_obj.strftime("%I"))
+        minute = int(time_obj.strftime("%M"))
+        ampm = time_obj.strftime("%p")
+        
+        self.hour_spinbox = ttk.Spinbox(time_input_frame, from_=1, to=12, width=3, 
+                                      format="%02.0f", wrap=True,
+                                      command=self.validate_time_input)
+        self.hour_spinbox.pack(side=tk.LEFT)
+        self.hour_spinbox.set(f"{hour_12:02}")
+        
         ttk.Label(time_input_frame, text=":").pack(side=tk.LEFT, padx=2)
-        self.minute_spinbox = ttk.Spinbox(time_input_frame, from_=0, to=59, width=3, format="%02.0f", wrap=True)
-        self.minute_spinbox.pack(side=tk.LEFT); self.minute_spinbox.set(m)
+        
+        self.minute_spinbox = ttk.Spinbox(time_input_frame, from_=0, to=59, width=3, 
+                                        format="%02.0f", wrap=True,
+                                        command=self.validate_time_input)
+        self.minute_spinbox.pack(side=tk.LEFT)
+        self.minute_spinbox.set(f"{minute:02}")
+        
         self.ampm_var = tk.StringVar(value=ampm)
-        self.ampm_combobox = ttk.Combobox(time_input_frame, textvariable=self.ampm_var, values=["AM", "PM"], width=3, state="readonly")
+        self.ampm_combobox = ttk.Combobox(time_input_frame, textvariable=self.ampm_var, 
+                                         values=["AM", "PM"], width=3, state="readonly")
         self.ampm_combobox.pack(side=tk.LEFT, padx=(5,0))
-        self.save_button = ttk.Button(form_frame, text="Save Changes", command=self.save_updated_reminder) # Command updated
-        self.save_button.grid(row=3, column=0, columnspan=3, pady=20, ipady=4)
-        form_frame.columnconfigure(1, weight=1); self.title_entry.focus_set()
+        
+        # Add quick time buttons
+        quick_time_frame = ttk.Frame(time_input_frame)
+        quick_time_frame.pack(side=tk.TOP, pady=(5,0))
+        
+        quick_times = ["Now", "Morning", "Noon", "Evening"]
+        for time_label in quick_times:
+            ttk.Button(quick_time_frame, text=time_label, width=8,
+                      command=lambda t=time_label: self.set_quick_time(t)).pack(side=tk.LEFT, padx=2)
 
-    # VVVV FULLY IMPLEMENTED SAVE LOGIC VVVV
+        # Enhanced Recurrence Frame
+        ttk.Label(form_frame, text="Repeat:").grid(row=3, column=0, sticky="w", padx=5, pady=(10,5))
+        recurrence_frame = ttk.Frame(form_frame)
+        recurrence_frame.grid(row=3, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
+        
+        # Get current recurrence type
+        current_recurrence = next((k for k, v in RECURRENCE_TYPES.items() if v == reminder.get("recurrence_type", "none")), "None")
+        self.recurrence_var = tk.StringVar(value=current_recurrence)
+        self.recurrence_combobox = ttk.Combobox(recurrence_frame, textvariable=self.recurrence_var,
+                                               values=list(RECURRENCE_TYPES.keys()), state="readonly")
+        self.recurrence_combobox.pack(side=tk.LEFT, padx=(0,5))
+        
+        # Add recurrence info label
+        self.recurrence_info = ttk.Label(recurrence_frame, text="", font=("Helvetica", 8))
+        self.recurrence_info.pack(side=tk.LEFT)
+        
+        # Bind to update info when selection changes
+        self.recurrence_combobox.bind('<<ComboboxSelected>>', self.update_recurrence_info)
+        self.update_recurrence_info()  # Initial update
+
+        # End Condition Frame
+        ttk.Label(form_frame, text="Ends:").grid(row=4, column=0, sticky="w", padx=5, pady=(10,5))
+        end_condition_frame = ttk.Frame(form_frame)
+        end_condition_frame.grid(row=4, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
+        
+        # Get current end condition
+        current_end_type = next((k for k, v in END_CONDITION_TYPES.items() 
+                               if v == reminder.get("recurrence_end_type", "never")), "Never")
+        self.end_condition_var = tk.StringVar(value=current_end_type)
+        self.end_condition_combobox = ttk.Combobox(end_condition_frame, textvariable=self.end_condition_var,
+                                                  values=list(END_CONDITION_TYPES.keys()), state="readonly")
+        self.end_condition_combobox.pack(side=tk.LEFT, padx=(0,5))
+        
+        # Bind to show/hide end condition inputs
+        self.end_condition_combobox.bind('<<ComboboxSelected>>', self.update_end_condition_inputs)
+        
+        # Frame for end condition specific inputs
+        self.end_condition_inputs_frame = ttk.Frame(end_condition_frame)
+        self.end_condition_inputs_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        
+        # Occurrences input with proper default value
+        occurrence_val_for_spinbox = "1"  # Default
+        if reminder.get("recurrence_end_type") == "occurrences":
+            stored_val = reminder.get("recurrence_end_value")
+            if isinstance(stored_val, int) and stored_val >= 1:
+                occurrence_val_for_spinbox = str(stored_val)
+        self.occurrences_var = tk.StringVar(value=occurrence_val_for_spinbox)
+        self.occurrences_spinbox = ttk.Spinbox(self.end_condition_inputs_frame, from_=1, to=MAX_OCCURRENCES,
+                                             textvariable=self.occurrences_var, width=5)
+        self.occurrences_spinbox.pack(side=tk.LEFT, padx=(0,5))
+        
+        # Create the "times" label once
+        self.occurrences_label = ttk.Label(self.end_condition_inputs_frame, text="times")
+        
+        # End date calendar
+        self.end_date_cal = Calendar(self.end_condition_inputs_frame, selectmode='day', 
+                                   date_pattern='yyyy-mm-dd', font="Arial 9")
+        self.end_date_cal.pack(side=tk.LEFT, padx=(5,0))
+        
+        # Set initial end date if exists
+        if reminder.get("recurrence_end_type") == "date" and reminder.get("recurrence_end_value"):
+            self.end_date_cal.selection_set(reminder["recurrence_end_value"])
+        
+        # Initially hide end condition inputs
+        self.update_end_condition_inputs()
+
+        # Save button
+        ttk.Button(form_frame, text="Save Changes", command=self.save_updated_reminder).grid(
+            row=5, column=0, columnspan=3, pady=20, ipady=4)
+        
+        form_frame.columnconfigure(1, weight=1)
+        self.title_entry.focus_set()
+
+    def validate_time_input(self, *args):
+        """Validate time input and ensure proper formatting."""
+        try:
+            hour = int(self.hour_spinbox.get())
+            minute = int(self.minute_spinbox.get())
+            
+            # Ensure proper ranges
+            if hour < 1: self.hour_spinbox.set("01")
+            if hour > 12: self.hour_spinbox.set("12")
+            if minute < 0: self.minute_spinbox.set("00")
+            if minute > 59: self.minute_spinbox.set("59")
+            
+            # Format with leading zeros
+            self.hour_spinbox.set(f"{int(self.hour_spinbox.get()):02}")
+            self.minute_spinbox.set(f"{int(self.minute_spinbox.get()):02}")
+        except ValueError:
+            # If invalid input, reset to current time
+            current_dt = datetime.now()
+            self.hour_spinbox.set(f"{int(current_dt.strftime('%I')):02}")
+            self.minute_spinbox.set(current_dt.strftime("%M"))
+            self.ampm_var.set(current_dt.strftime("%p"))
+
+    def set_quick_time(self, time_label):
+        """Set time based on quick time selection."""
+        current_dt = datetime.now()
+        if time_label == "Now":
+            self.hour_spinbox.set(f"{int(current_dt.strftime('%I')):02}")
+            self.minute_spinbox.set(current_dt.strftime("%M"))
+            self.ampm_var.set(current_dt.strftime("%p"))
+        elif time_label == "Morning":
+            self.hour_spinbox.set("09")
+            self.minute_spinbox.set("00")
+            self.ampm_var.set("AM")
+        elif time_label == "Noon":
+            self.hour_spinbox.set("12")
+            self.minute_spinbox.set("00")
+            self.ampm_var.set("PM")
+        elif time_label == "Evening":
+            self.hour_spinbox.set("06")
+            self.minute_spinbox.set("00")
+            self.ampm_var.set("PM")
+
+    def update_recurrence_info(self, event=None):
+        """Update the recurrence info label based on selection."""
+        recurrence_type = self.recurrence_var.get()
+        if recurrence_type == "None":
+            self.recurrence_info.config(text="")
+        elif recurrence_type == "Daily":
+            self.recurrence_info.config(text="Repeats every day")
+        elif recurrence_type == "Weekdays":
+            self.recurrence_info.config(text="Repeats Monday to Friday")
+        elif recurrence_type == "Weekly":
+            self.recurrence_info.config(text="Repeats every week")
+        elif recurrence_type == "Biweekly":
+            self.recurrence_info.config(text="Repeats every two weeks")
+        elif recurrence_type == "Monthly":
+            self.recurrence_info.config(text="Repeats every month")
+        elif recurrence_type == "Yearly":
+            self.recurrence_info.config(text="Repeats every year")
+
+    def update_end_condition_inputs(self, event=None):
+        """Show/hide end condition specific inputs based on selection."""
+        # Hide all inputs first
+        self.occurrences_spinbox.pack_forget()
+        self.occurrences_label.pack_forget()
+        self.end_date_cal.pack_forget()
+        
+        # Show relevant input based on selection
+        end_type = self.end_condition_var.get()
+        if end_type == "After":
+            self.occurrences_spinbox.pack(side=tk.LEFT, padx=(0,5))
+            self.occurrences_label.pack(side=tk.LEFT)
+        elif end_type == "On Date":
+            self.end_date_cal.pack(side=tk.LEFT, padx=(5,0))
+            # Ensure end date is after start date
+            start_date = datetime.strptime(self.cal.get_date(), "%Y-%m-%d").date()
+            self.end_date_cal.selection_set(start_date + timedelta(days=1))
+
     def save_updated_reminder(self):
-        original_id = self.reminder_to_edit.get('id')
-        new_title = self.title_entry.get().strip()
-        new_selected_date_str = self.cal.get_date()
-        new_hour_12_str = self.hour_spinbox.get().strip()
-        new_minute_str = self.minute_spinbox.get().strip()
-        new_ampm_val = self.ampm_var.get()
+        title = self.title_entry.get().strip()
+        selected_date_str = self.cal.get_date()
+        hour_12_str = self.hour_spinbox.get().strip()
+        minute_str = self.minute_spinbox.get().strip()
+        ampm_val = self.ampm_var.get()
+        recurrence_type = RECURRENCE_TYPES[self.recurrence_var.get()]
+        end_condition_type = END_CONDITION_TYPES[self.end_condition_var.get()]
 
-        if not new_title:
+        if not title:
             messagebox.showerror("Input Error", "Title cannot be empty.", parent=self.edit_window)
             return
-        
-        # Validate time components (similar to AddReminderWindow)
-        if not new_hour_12_str.isdigit() or not new_minute_str.isdigit():
-            messagebox.showerror("Input Error", "Hour and Minute must be numeric digits.", parent=self.edit_window)
-            return
-        try:
-            new_hour_12_int = int(new_hour_12_str)
-            new_minute_int = int(new_minute_str)
-        except ValueError: # Should be caught by isdigit, but for safety
-            messagebox.showerror("Input Error", "Hour and Minute must be valid numbers.", parent=self.edit_window)
-            return
-        if not (1 <= new_hour_12_int <= 12):
-            messagebox.showerror("Input Error", "Hour must be between 1 and 12.", parent=self.edit_window)
-            self.hour_spinbox.focus_set(); return
-        if not (0 <= new_minute_int <= 59):
-            messagebox.showerror("Input Error", "Minute must be between 0 and 59.", parent=self.edit_window)
-            self.minute_spinbox.focus_set(); return
 
-        # Convert new time to 24-hour format for saving
-        try:
-            new_time_12h_input_str = f"{new_hour_12_int:02}:{new_minute_int:02} {new_ampm_val}"
-            new_time_obj_24h = datetime.strptime(new_time_12h_input_str, "%I:%M %p")
-            new_time_str_24h_to_save = new_time_obj_24h.strftime("%H:%M")
-        except ValueError:
-            messagebox.showerror("Input Error", f"Invalid time format: {new_time_12h_input_str}", parent=self.edit_window)
+        if not hour_12_str.isdigit() or not minute_str.isdigit():
+            messagebox.showerror("Input Error", "Hour/Minute must be numeric.", parent=self.edit_window)
             return
 
-        all_reminders = load_reminders()
-        found_and_updated = False
-        for reminder in all_reminders:
-            if reminder.get("id") == original_id:
-                # Check if date or time has changed to reset notification flag
-                if (reminder.get("date") != new_selected_date_str or
-                    reminder.get("time") != new_time_str_24h_to_save):
-                    reminder["notified_individually"] = False
-                
-                reminder["title"] = new_title
-                reminder["date"] = new_selected_date_str
-                reminder["time"] = new_time_str_24h_to_save
-                found_and_updated = True
+        hour_12_int, minute_int = int(hour_12_str), int(minute_str)
+        if not (1 <= hour_12_int <= 12 and 0 <= minute_int <= 59):
+            messagebox.showerror("Input Error", "Hour/Minute out of range.", parent=self.edit_window)
+            return
+
+        try:
+            time_obj_24h = datetime.strptime(f"{hour_12_int:02}:{minute_int:02} {ampm_val}", "%I:%M %p")
+            time_str_24h_to_save = time_obj_24h.strftime("%H:%M")
+        except ValueError as e:
+            log_error(f"Time conversion error: {e}", exc_info=True)
+            messagebox.showerror("Input Error", "Invalid time format.", parent=self.edit_window)
+            return
+
+        # Validate end conditions
+        if end_condition_type == "occurrences":
+            try:
+                occurrences = int(self.occurrences_var.get())
+                if not (1 <= occurrences <= MAX_OCCURRENCES):
+                    messagebox.showerror("Input Error", f"Number of occurrences must be between 1 and {MAX_OCCURRENCES}.", 
+                                       parent=self.edit_window)
+                    return
+            except ValueError:
+                messagebox.showerror("Input Error", "Number of occurrences must be a valid number.", 
+                                   parent=self.edit_window)
+                return
+        elif end_condition_type == "date":
+            end_date = datetime.strptime(self.end_date_cal.get_date(), "%Y-%m-%d").date()
+            start_date = datetime.strptime(selected_date_str, "%Y-%m-%d").date()
+            if end_date <= start_date:
+                messagebox.showerror("Input Error", "End date must be after start date.", 
+                                   parent=self.edit_window)
+                return
+
+        # Determine if recurrence parameters changed
+        did_start_date_change = self.reminder["date"] != selected_date_str
+        did_recurrence_rule_change = (
+            self.reminder.get("recurrence_type") != recurrence_type or
+            self.reminder.get("recurrence_end_type") != end_condition_type or
+            self.reminder.get("recurrence_end_value") != (
+                int(self.occurrences_var.get()) if end_condition_type == "occurrences"
+                else self.end_date_cal.get_date() if end_condition_type == "date"
+                else None
+            )
+        )
+
+        # Handle recurrence count
+        current_count_to_save = None
+        if end_condition_type == "occurrences":
+            if (self.reminder.get("recurrence_end_type") == "occurrences" and
+                not (did_start_date_change or did_recurrence_rule_change)):
+                # Preserve existing count if no fundamental changes
+                current_count_to_save = self.reminder.get("recurrence_current_count", 0)
+            else:
+                # Reset count for new occurrences type or fundamental changes
+                current_count_to_save = 0
+
+        # Update reminder data
+        self.reminder.update({
+            "title": title,
+            "date": selected_date_str,
+            "time": time_str_24h_to_save,
+            "recurrence_type": recurrence_type,
+            "recurrence_end_type": end_condition_type,
+            "recurrence_end_value": (
+                int(self.occurrences_var.get()) if end_condition_type == "occurrences"
+                else self.end_date_cal.get_date() if end_condition_type == "date"
+                else None
+            ),
+            "recurrence_current_count": current_count_to_save
+        })
+
+        # Save changes
+        reminders = load_reminders()
+        for i, r in enumerate(reminders):
+            if r["id"] == self.reminder["id"]:
+                reminders[i] = self.reminder
                 break
-        
-        if found_and_updated:
-            save_reminders(all_reminders)
-            messagebox.showinfo("Success", "Reminder updated successfully!", parent=self.parent) # Parent is main window
-            self.main_app.populate_reminders_list()
-            self.edit_window.destroy()
-        else:
-            # This should ideally not happen if the selection logic is correct
-            messagebox.showerror("Error", "Could not find the original reminder to update. It may have been deleted.", parent=self.edit_window)
+        save_reminders(reminders)
+        messagebox.showinfo("Success", "Reminder updated!", parent=self.edit_window)
+        self.main_app.populate_reminders_list()
+        self.edit_window.destroy()
 
 
 # --- SYSTEM TRAY ICON SETUP ---
@@ -613,13 +1271,13 @@ def setup_system_tray(): # Your version from the provided code
                       Menu.SEPARATOR,
                       item('Quit', quit_application_action))
         tray_icon_object = pystray.Icon(APP_NAME, pil_image, APP_NAME, menu_items)
-        print("Starting tray icon thread...")
+        log_info("Starting tray icon thread...")
         tray_icon_object.run() # This blocks until tray_icon_object.stop() is called
-        print("Tray icon thread finished.")
+        log_info("Tray icon thread finished.")
     except FileNotFoundError:
-        print(f"Error: Tray icon image '{LOGO_FILE}' not found. Tray icon disabled.")
+        log_error(f"Error: Tray icon image '{LOGO_FILE}' not found. Tray icon disabled.")
     except Exception as e:
-        print(f"Error setting up system tray: {e}")
+        log_error(f"Error setting up system tray: {e}")
 
 # --- MAIN EXECUTION ---
 if __name__ == "__main__":
@@ -631,21 +1289,21 @@ if __name__ == "__main__":
 
     try:
         if len(sys.argv) > 1 and sys.argv[1] == 'startup_check':
-            print("Running startup_check...")
+            log_info("Running startup_check...")
             temp_startup_root = tk.Tk()
             temp_startup_root.withdraw()
             today_str = date.today().strftime("%Y-%m-%d")
             app_config = load_app_config()
             last_check_date = app_config.get("last_startup_check_date")
             if last_check_date != today_str:
-                print(f"Performing daily reminder summary for {today_str}.")
+                log_info(f"Performing daily reminder summary for {today_str}.")
                 todays_reminders_list = get_all_todays_reminders() # Uses the simple "actual today" version
                 display_reminders_popup(todays_reminders_list, f"Reminders for Today ({today_str})", temp_startup_root)
                 app_config["last_startup_check_date"] = today_str
                 save_app_config(app_config)
-                print("Startup check complete.")
+                log_info("Startup check complete.")
             else:
-                print(f"Daily summary already shown for {today_str}.")
+                log_info(f"Daily summary already shown for {today_str}.")
             temp_startup_root.destroy()
             sys.exit(0)
 
@@ -653,9 +1311,9 @@ if __name__ == "__main__":
         SHOULD_START_HIDDEN = False
         if len(sys.argv) > 1 and sys.argv[1] == 'start_minimized':
             SHOULD_START_HIDDEN = True
-            print(f"{APP_NAME} starting minimized to tray.")
+            log_info(f"{APP_NAME} starting minimized to tray.")
         else:
-            print(f"{APP_NAME} starting in full mode.")
+            log_info(f"{APP_NAME} starting in full mode.")
 
         scheduler_thread = threading.Thread(target=run_scheduler, daemon=True); scheduler_thread.start()
         
@@ -676,16 +1334,16 @@ if __name__ == "__main__":
         tray_thread = threading.Thread(target=setup_system_tray, daemon=True)
         tray_thread.start()
         
-        print("Main GUI and Threads initialized. Entering Tkinter mainloop.")
+        log_info("Main GUI and Threads initialized. Entering Tkinter mainloop.")
         main_window_root.mainloop()
 
     except SystemExit: # Allow sys.exit() to pass through for startup_check and lock fail
         pass
     except Exception as e:
-        print(f"An unhandled error occurred: {e}")
+        log_error(f"An unhandled error occurred: {e}")
         messagebox.showerror("Critical Error", f"An unexpected error occurred: {e}\nThe application might need to close.")
     finally:
-        print("Application is exiting. Cleaning up...")
+        log_info("Application is exiting. Cleaning up...")
         if not is_utility_run: # Only cleanup lock if it was a full app run
             cleanup_lock_file()
         
@@ -694,4 +1352,4 @@ if __name__ == "__main__":
             scheduler_thread.join(timeout=2)
         
         # Tray icon stopping is handled by quit_application_action or program termination for daemon thread
-        print(f"{APP_NAME} finished.")
+        log_info(f"{APP_NAME} finished.")
