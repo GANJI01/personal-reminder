@@ -36,7 +36,13 @@ def data_file_path(filename):
     """ Get path for data files, typically next to EXE or script """
     if getattr(sys, 'frozen', False):
         # Running as a bundled executable (PyInstaller)
-        application_path = os.path.dirname(sys.executable)
+        exe_dir = os.path.dirname(sys.executable)
+        # If running from 'dist', look in the parent directory
+        if os.path.basename(exe_dir).lower() == 'dist':
+            application_path = os.path.dirname(exe_dir)
+        else:
+            # Otherwise, look next to the executable
+            application_path = exe_dir
     else:
         # Running as a script
         application_path = os.path.dirname(os.path.abspath(__file__))
@@ -133,39 +139,95 @@ def check_single_instance():
     # The `startup_check` might be okay to run even if the main app is running,
     # or we ensure it's very quick and cleans up its own (if it used a lock).
     # For now, this global lock will prevent any second launch if lock exists.
-    if os.path.exists(LOCK_FILE):
-        # Check if the process ID in the lock file is still running (more robust)
+
+    # Determine the correct lock file path based on how the app is run
+    current_app_path = sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(__file__)
+    current_dir = os.path.dirname(current_app_path)
+    
+    # If running from dist, the lock file is in dist. Otherwise, it's in the base dir.
+    # Note: The data_file_path logic for the executable looks *up* if in dist, 
+    # but the lock file logic here needs to check relative to the executable itself.
+    # Let's use a more direct check based on the running executable's location.
+    is_running_from_dist_dir = os.path.basename(current_dir).lower() == 'dist'
+    actual_lock_file_path = os.path.join(current_dir, 'app.lock') # Lock file is always next to the running executable
+
+    log_debug(f"Checking for lock file: {actual_lock_file_path}")
+
+    if os.path.exists(actual_lock_file_path):
+        log_info(f"Lock file '{actual_lock_file_path}' exists.")
         try:
-            with open(LOCK_FILE, 'r') as f:
-                pid = int(f.read())
-            # Simple check if process exists (platform dependent, this is a basic try)
-            # On Windows, os.kill(pid, 0) with signal 0 can check existence.
-            # On POSIX, same. But permissions can be an issue.
-            # For simplicity, we'll stick to file existence, but this can be improved.
-            # If process with pid is not running, old lock file should be removed.
-            # For now, if file exists, assume another instance is active.
-            log_info(f"Lock file '{LOCK_FILE}' exists. Another instance might be running or exited uncleanly.")
-            messagebox.showwarning(APP_NAME, "Another instance of the application appears to be running.\nIf not, please delete the 'app.lock' file.")
-            sys.exit(0) # Exit if lock file exists
-        except Exception as e:
-            log_error(f"Error checking lock file PID: {e}", exc_info=True)
-            # Fallback to simple existence check if PID reading fails
-            messagebox.showwarning(APP_NAME, "Could not verify lock file. Another instance might be running.")
-            sys.exit(0)
+            with open(actual_lock_file_path, 'r') as f:
+                pid_str = f.read().strip()
+                pid = int(pid_str) if pid_str.isdigit() else -1
+            log_debug(f"Found PID {pid} in lock file.")
 
+            # Attempt to check if the process is actually running
+            # This is a basic attempt and might not work in all environments or permissions.
+            is_process_running = False
+            if pid > 0:
+                try:
+                    # On Windows, signal 0 checks existence without sending a signal
+                    os.kill(pid, 0) 
+                    is_process_running = True
+                    log_debug(f"Process with PID {pid} appears to be running.")
+                except OSError as e:
+                    # Process does not exist or permission error
+                    log_debug(f"Process with PID {pid} check failed: {e}")
+                    is_process_running = False # Process is not running or we can't verify
+                except Exception as e:
+                     log_error(f"Unexpected error checking PID {pid}: {e}", exc_info=True)
+                     is_process_running = False # Assume not running on error
 
-    with open(LOCK_FILE, 'w') as f:
-        f.write(str(os.getpid()))
-    log_debug(f"Created lock file with PID {os.getpid()}")
-    atexit.register(cleanup_lock_file) # Ensure cleanup on normal exit
+            if is_process_running:
+                 log_info("Another instance is confirmed to be running.")
+                 messagebox.showwarning(APP_NAME, "Another instance of the application is already running.")
+                 sys.exit(0) # Exit if another instance is running
+            else:
+                 # Lock file exists but process is not running. Clean it up.
+                 log_info(f"Lock file '{actual_lock_file_path}' found but process {pid} is not running. Attempting to clean up.")
+                 try:
+                     os.remove(actual_lock_file_path)
+                     log_info("Stale lock file cleaned up successfully.")
+                 except Exception as e:
+                     log_error(f"Error cleaning up stale lock file '{actual_lock_file_path}': {e}", exc_info=True)
+                     # Even if cleanup fails, we assume the process is not running and continue
 
-def cleanup_lock_file():
-    if os.path.exists(LOCK_FILE):
+        except FileNotFoundError: # Should be caught by os.path.exists, but for safety
+             log_debug("Lock file disappeared during check.")
+             pass # File was deleted between check and open
+        except Exception as e: # Catch errors reading the PID from the file
+            log_error(f"Error reading or processing PID from lock file '{actual_lock_file_path}': {e}", exc_info=True)
+            log_info(f"Assuming lock file '{actual_lock_file_path}' is stale due to read error. Attempting to clean up.")
+            try:
+                 os.remove(actual_lock_file_path)
+                 log_info("Stale lock file cleaned up successfully after read error.")
+            except Exception as e_del:
+                 log_error(f"Error cleaning up lock file '{actual_lock_file_path}' after read error: {e_del}", exc_info=True)
+            # Continue execution as we assume the previous instance is not running
+
+    # If no lock file exists, or if a stale one was cleaned up, create a new one.
+    # Only create the lock file if not running a utility command (like startup_check)
+    is_utility_run = len(sys.argv) > 1 and sys.argv[1] in ['startup_check', 'start_minimized']
+    if not is_utility_run:
         try:
-            os.remove(LOCK_FILE)
-            log_debug("Lock file cleaned up successfully.")
+            with open(actual_lock_file_path, 'w') as f:
+                f.write(str(os.getpid()))
+            log_debug(f"Created new lock file with PID {os.getpid()} at '{actual_lock_file_path}'.")
+            # Register cleanup *only* if we successfully created the lock file
+            atexit.register(lambda file_path=actual_lock_file_path: cleanup_lock_file(file_path))
         except Exception as e:
-            log_error(f"Error cleaning up lock file: {e}", exc_info=True)
+            log_error(f"Error creating lock file '{actual_lock_file_path}': {e}", exc_info=True)
+            # Application might continue, but without lock protection
+
+def cleanup_lock_file(file_path):
+    """Cleans up the specified lock file on exit."""
+    log_debug(f"Attempting to clean up lock file: {file_path}")
+    if os.path.exists(file_path):
+        try:
+            os.remove(file_path)
+            log_debug(f"Lock file '{file_path}' cleaned up successfully.")
+        except Exception as e:
+            log_error(f"Error cleaning up lock file '{file_path}': {e}", exc_info=True)
 
 # --- GLOBAL VARIABLES --- (Your existing ones)
 tk_root_window = None
@@ -173,6 +235,7 @@ scheduler_stop_event = threading.Event()
 app_instance_ref = None
 tray_icon_object = None
 main_gui_visible = True
+app_to_run_path = None # Global variable for autostart path
 
 # --- DATA HANDLING FUNCTIONS --- (Your existing ones)
 def load_reminders():
@@ -336,22 +399,41 @@ def snooze_reminder(reminder_id, minutes):
 
 def check_and_notify_due_reminders():
     """Check for due reminders and notify if needed."""
+    log_debug("Checking for due reminders...")
     try:
         reminders = load_reminders()
         current_time = datetime.now()
+        log_debug(f"Current time: {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
         updated_reminders = []
         data_changed = False
 
         for reminder in reminders:
-            reminder_time = datetime.strptime(f"{reminder['date']} {reminder['time']}", "%Y-%m-%d %H:%M")
-            
+            reminder_id = reminder.get("id", "N/A")
+            reminder_title = reminder.get("title", "N/A")
+            reminder_date = reminder.get("date", "N/A")
+            reminder_time_str = reminder.get("time", "N/A")
+            notified_status = reminder.get("notified_individually", False)
+
+            log_debug(f"Checking reminder {reminder_id} ('{reminder_title}') on {reminder_date} at {reminder_time_str}. Notified: {notified_status}")
+
             # Skip if already notified
-            if reminder.get("notified_individually", False):
+            if notified_status:
+                log_debug(f"Skipping reminder {reminder_id} - already notified.")
                 updated_reminders.append(reminder)
                 continue
 
+            # Try to parse reminder time
+            try:
+                reminder_datetime = datetime.strptime(f"{reminder_date} {reminder_time_str}", "%Y-%m-%d %H:%M")
+                log_debug(f"Parsed reminder datetime: {reminder_datetime.strftime('%Y-%m-%d %H:%M:%S')}")
+            except ValueError:
+                log_error(f"Invalid date or time format for reminder ID {reminder_id}: {reminder_date} {reminder_time_str}")
+                updated_reminders.append(reminder)
+                continue # Skip this reminder due to invalid format
+
             # Check if reminder is due
-            if reminder_time <= current_time:
+            if reminder_datetime <= current_time:
+                log_debug(f"Reminder {reminder_id} is due. Triggering notification.")
                 # Show notification for current instance using the correct function
                 show_individual_reminder_popup_thread_safe(
                     reminder.get("title"),
@@ -360,9 +442,11 @@ def check_and_notify_due_reminders():
                 )
                 reminder["notified_individually"] = True
                 data_changed = True
+                log_debug(f"Marked reminder {reminder_id} as notified_individually=True.")
 
                 # Handle recurring reminders
                 if reminder.get("recurrence_type") is not None:
+                    log_debug(f"Handling recurrence for reminder {reminder_id}.")
                     # Check end conditions
                     end_type = reminder.get("recurrence_end_type", "never")
                     series_ended = False
@@ -370,13 +454,17 @@ def check_and_notify_due_reminders():
                     if end_type == "occurrences":
                         current_count = reminder.get("recurrence_current_count", 0)
                         max_occurrences = reminder.get("recurrence_end_value")
+                        log_debug(f"Occurrences end condition: current={current_count}, max={max_occurrences}.")
                         if current_count >= max_occurrences:
                             series_ended = True
+                            log_debug(f"Series ended for {reminder_id} - max occurrences reached.")
                         else:
                             reminder["recurrence_current_count"] = current_count + 1
+                            log_debug(f"Incremented occurrence count for {reminder_id} to {reminder["recurrence_current_count"]}.")
 
                     # Calculate next date before checking date-based end condition
                     next_date_str = calculate_next_recurrence(reminder)
+                    log_debug(f"Calculated next recurrence date for {reminder_id}: {next_date_str}")
                     
                     # Check date-based end condition using the next calculated date
                     if not series_ended and end_type == "date":
@@ -384,39 +472,59 @@ def check_and_notify_due_reminders():
                         if recurrence_end_date_str:
                             try:
                                 recurrence_end_date_obj = datetime.strptime(recurrence_end_date_str, "%Y-%m-%d").date()
-                                next_calculated_date_obj = datetime.strptime(next_date_str, "%Y-%m-%d").date()
-                                
-                                if next_calculated_date_obj > recurrence_end_date_obj:
-                                    log_debug(f"Next calculated date {next_date_str} is past end date {recurrence_end_date_str}. Series ends for {reminder.get('id')}")
-                                    series_ended = True
-                            except (ValueError, TypeError) as e_date_conv:
-                                log_error(f"Invalid end date format '{recurrence_end_date_str}' or next date '{next_date_str}' for reminder ID {reminder.get('id')}", exc_info=True)
-                                series_ended = True
+                                # Ensure next_date_str is not None before parsing
+                                if next_date_str:
+                                    next_calculated_date_obj = datetime.strptime(next_date_str, "%Y-%m-%d").date()
+                                    
+                                    if next_calculated_date_obj > recurrence_end_date_obj:
+                                        log_debug(f"Next calculated date {next_date_str} is past end date {recurrence_end_date_str}. Series ends for {reminder_id}.")
+                                        series_ended = True
+                                else:
+                                     log_debug(f"Next date calculation returned None for {reminder_id}, cannot check end date condition.")
+                                     series_ended = True # Or handle as an error
 
-                    # Create next occurrence if series hasn't ended
+                            except (ValueError, TypeError) as e_date_conv:
+                                log_error(f"Invalid end date format '{recurrence_end_date_str}' or issue with next date '{next_date_str}' for reminder ID {reminder_id}: {e_date_conv}", exc_info=True)
+                                series_ended = True # Assume series ends on error
+
+                    # Create next occurrence if series hasn't ended and a next date was calculated
                     if not series_ended and next_date_str:
                         new_reminder = reminder.copy()
-                        new_reminder["id"] = str(uuid.uuid4())
+                        new_reminder["id"] = str(uuid.uuid4()) # Assign new ID
                         new_reminder["date"] = next_date_str
+                        new_reminder["time"] = reminder_time_str # Keep the same time as the original
                         new_reminder["notified_individually"] = False
-                        # Preserve current count for occurrences type
+                        # Preserve current count for occurrences type (already incremented on original)
+                        # For recurring reminders, the count is stored on the NEXT instance.
                         if end_type == "occurrences":
-                            new_reminder["recurrence_current_count"] = reminder["recurrence_current_count"]
+                             # The count was incremented on the *current* reminder before this check.
+                             # The *new* reminder should inherit this incremented count.
+                             new_reminder["recurrence_current_count"] = reminder["recurrence_current_count"]
+                        else:
+                             new_reminder["recurrence_current_count"] = None # Ensure it's None for non-occurrences
+
                         updated_reminders.append(new_reminder)
                         data_changed = True
+                        log_debug(f"Created next occurrence for {reminder_id} with new ID {new_reminder['id']} on {next_date_str}.")
 
                 # Add the original (now notified) reminder
                 updated_reminders.append(reminder)
             else:
                 # Not due yet, keep as is
+                log_debug(f"Reminder {reminder_id} is not yet due.")
                 updated_reminders.append(reminder)
 
         # Save changes if any were made
         if data_changed:
+            log_debug("Changes detected, saving reminders.")
             save_reminders(updated_reminders)
+        else:
+            log_debug("No changes to reminders, skipping save.")
 
     except Exception as e:
         log_error(f"Error checking due reminders: {e}", exc_info=True)
+
+    log_debug("Finished checking due reminders.")
 
 def delete_past_reminders():
     """Delete reminders from past dates."""
@@ -864,8 +972,7 @@ class AddReminderWindow:
         # End date calendar
         self.end_date_cal = Calendar(self.end_condition_inputs_frame, selectmode='day', 
                                    date_pattern='yyyy-mm-dd', font="Arial 9")
-        # self.end_date_cal.pack(...) is handled by update_end_condition_inputs
-        # Initial selection for end_date_cal is handled by update_end_condition_inputs when "On Date" is picked
+        # self.end_date_cal.pack(...) is handled by update_end_condition_inputs when "On Date" is picked
 
         # Initially hide/show end condition inputs based on default "Never"
         self.update_end_condition_inputs()
@@ -876,6 +983,66 @@ class AddReminderWindow:
         
         form_frame.columnconfigure(1, weight=1)
         self.title_entry.focus_set()
+
+    def validate_time_input(self, *args):
+        """Validate time input and ensure proper formatting."""
+        try:
+            hour = int(self.hour_spinbox.get())
+            minute = int(self.minute_spinbox.get())
+            
+            # Ensure proper ranges
+            if hour < 1: self.hour_spinbox.set("01")
+            if hour > 12: self.hour_spinbox.set("12")
+            if minute < 0: self.minute_spinbox.set("00")
+            if minute > 59: self.minute_spinbox.set("59")
+            
+            # Format with leading zeros
+            self.hour_spinbox.set(f"{int(self.hour_spinbox.get()):02}")
+            self.minute_spinbox.set(f"{int(self.minute_spinbox.get()):02}")
+        except ValueError:
+            # If invalid input, reset to current time
+            current_dt = datetime.now()
+            self.hour_spinbox.set(f"{int(current_dt.strftime('%I')):02}")
+            self.minute_spinbox.set(current_dt.strftime("%M"))
+            self.ampm_var.set(current_dt.strftime("%p"))
+
+    def set_quick_time(self, time_label):
+        """Set time based on quick time selection."""
+        current_dt = datetime.now()
+        if time_label == "Now":
+            self.hour_spinbox.set(f"{int(current_dt.strftime('%I')):02}")
+            self.minute_spinbox.set(current_dt.strftime("%M"))
+            self.ampm_var.set(current_dt.strftime("%p"))
+        elif time_label == "Morning":
+            self.hour_spinbox.set("09")
+            self.minute_spinbox.set("00")
+            self.ampm_var.set("AM")
+        elif time_label == "Noon":
+            self.hour_spinbox.set("12")
+            self.minute_spinbox.set("00")
+            self.ampm_var.set("PM")
+        elif time_label == "Evening":
+            self.hour_spinbox.set("06")
+            self.minute_spinbox.set("00")
+            self.ampm_var.set("PM")
+
+    def update_recurrence_info(self, event=None):
+        """Update the recurrence info label based on selection."""
+        recurrence_type = self.recurrence_var.get()
+        if recurrence_type == "None":
+            self.recurrence_info.config(text="")
+        elif recurrence_type == "Daily":
+            self.recurrence_info.config(text="Repeats every day")
+        elif recurrence_type == "Weekdays":
+            self.recurrence_info.config(text="Repeats Monday to Friday")
+        elif recurrence_type == "Weekly":
+            self.recurrence_info.config(text="Repeats every week")
+        elif recurrence_type == "Biweekly":
+            self.recurrence_info.config(text="Repeats every two weeks")
+        elif recurrence_type == "Monthly":
+            self.recurrence_info.config(text="Repeats every month")
+        elif recurrence_type == "Yearly":
+            self.recurrence_info.config(text="Repeats every year")
 
     def update_end_condition_inputs(self, event=None):
         """Show/hide end condition specific inputs based on selection."""
@@ -1256,11 +1423,13 @@ class EditReminderWindow:
             end_date = datetime.strptime(self.end_date_cal.get_date(), "%Y-%m-%d").date()
             start_date = datetime.strptime(selected_date_str, "%Y-%m-%d").date()
             if end_date <= start_date:
-                messagebox.showerror("Input Error", "End date must be after start date.", parent=self.edit_window)
+                messagebox.showerror("Input Error", "End date must be after start date.", 
+                                   parent=self.edit_window)
                 return
 
         # Determine if recurrence parameters changed
         did_start_date_change = self.reminder["date"] != selected_date_str
+        did_time_change = self.reminder["time"] != time_str_24h_to_save
         did_recurrence_rule_change = (
             self.reminder.get("recurrence_type") != recurrence_type or
             self.reminder.get("recurrence_end_type") != end_condition_type or
@@ -1296,6 +1465,11 @@ class EditReminderWindow:
             ),
             "recurrence_current_count": current_count_to_save
         })
+
+        # Reset notification status if date or time changed
+        if did_start_date_change or did_time_change:
+            self.reminder["notified_individually"] = False
+            log_debug(f"Resetting notification status for reminder {self.reminder.get('id')} due to date/time change.")
 
         # Save changes
         reminders = load_reminders()
