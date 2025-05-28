@@ -56,7 +56,7 @@ DATA_FILE = data_file_path("reminders.json")
 CONFIG_FILE = data_file_path("app_config.json")
 LOCK_FILE = data_file_path('app.lock') # Lock file also next to exe/script
 
-INDIVIDUAL_NOTIFICATION_CHECK_INTERVAL_SECONDS = 1 # As per your setting
+INDIVIDUAL_NOTIFICATION_CHECK_INTERVAL_SECONDS = 60 # Check every minute instead of every second
 NOTIFICATION_WINDOW_MINUTES = 0 # As per your setting (affects check_and_notify_due_reminders old logic, new logic is different)
 
 # Recurring reminder constants
@@ -229,7 +229,7 @@ def cleanup_lock_file(file_path):
         except Exception as e:
             log_error(f"Error cleaning up lock file '{file_path}': {e}", exc_info=True)
 
-# --- GLOBAL VARIABLES --- (Your existing ones)
+# --- GLOBAL VARIABLES ---
 tk_root_window = None
 scheduler_stop_event = threading.Event()
 app_instance_ref = None
@@ -669,9 +669,9 @@ class ReminderApp:
         self.app_icon_photo = None
 
         try:
-            img = Image.open(LOGO_FILE)
-            self.app_icon_photo = ImageTk.PhotoImage(img)
-            self.root.iconphoto(True, self.app_icon_photo)
+            img = Image.open(LOGO_FILE) # Load the image file
+            self.app_icon_photo = ImageTk.PhotoImage(img) # Convert for Tkinter
+            self.root.iconphoto(True, self.app_icon_photo) # Set as window icon
         except Exception as e:
             log_error(f"Warn: App logo '{LOGO_FILE}' not found/loadable: {e}")
             self.app_icon_photo = None
@@ -712,7 +712,7 @@ class ReminderApp:
         sort_combo.bind('<<ComboboxSelected>>', lambda e: self.apply_filters())
 
         # Title label
-        self.title_label = ttk.Label(main_frame, text="All Reminders", font=("Helvetica", 16, "bold"), anchor="center")
+        self.title_label = ttk.Label(main_frame, text="Upcoming Reminders", font=("Helvetica", 16, "bold"), anchor="center")
         self.title_label.grid(row=2, column=0, columnspan=2, pady=(5,0), sticky=tk.EW)
 
         # Treeview
@@ -747,8 +747,9 @@ class ReminderApp:
         main_frame.rowconfigure(3, weight=1)
 
         self.populate_reminders_list()
-        if main_gui_visible:
-             self.show_app_init_reminders_popup()
+
+        # Now that the default filter is set, populate the list
+        self.populate_reminders_list()
 
     def apply_filters(self):
         """Apply current filter and sort settings to the reminders list."""
@@ -760,12 +761,18 @@ class ReminderApp:
         filter_type = self.filter_var.get()
         if filter_type == "Today":
             reminders = [r for r in reminders if r.get("date") == today_str]
+            self.title_label.config(text="Today's Reminders")
         elif filter_type == "Upcoming":
             reminders = [r for r in reminders if r.get("date") > today_str]
+            self.title_label.config(text="Upcoming Reminders")
         elif filter_type == "Past":
             reminders = [r for r in reminders if r.get("date") < today_str]
+            self.title_label.config(text="Past Reminders")
         elif filter_type == "Recurring":
             reminders = [r for r in reminders if r.get("recurrence_type")]
+            self.title_label.config(text="Recurring Reminders")
+        else: # "All"
+            self.title_label.config(text="All Reminders")
 
         # Apply sort
         sort_by = self.sort_var.get()
@@ -798,12 +805,9 @@ class ReminderApp:
 
     def populate_reminders_list(self):
         """Populate the reminders list with current filter and sort settings."""
+        # Delete past reminders before populating the list
+        delete_past_reminders()
         self.apply_filters()
-
-    def show_app_init_reminders_popup(self):
-        reminders, title_prefix = get_upcoming_todays_reminders()
-        if reminders:
-            display_reminders_popup(reminders, f"{title_prefix} Upcoming Reminders", self.root)
 
     def open_add_reminder_window(self):
         AddReminderWindow(self.root, self)
@@ -1501,77 +1505,122 @@ def setup_system_tray(): # Your version from the provided code
     except Exception as e:
         log_error(f"Error setting up system tray: {e}")
 
-# --- MAIN EXECUTION ---
+# --- MODIFIED MAIN EXECUTION ---
 if __name__ == "__main__":
-    # Single instance check should be selective if startup_check is meant to be quick
-    # For now, if any argument is passed (like startup_check or start_minimized), skip lock
-    is_utility_run = len(sys.argv) > 1 
-    if not is_utility_run:
-        check_single_instance() # Only check for full normal launch
+    import argparse
+    parser = argparse.ArgumentParser(description=APP_NAME)
+    parser.add_argument(
+        '--startup-mode',
+        choices=['normal', 'autostart_with_daily_check', 'minimized_only', 'startup_check_only'],
+        default='normal',
+        help="Defines how the application starts."
+    )
+    
+    args, unknown_args = parser.parse_known_args()
+    effective_startup_mode = args.startup_mode
+
+    if len(sys.argv) > 1 and sys.argv[1] == 'startup_check' and effective_startup_mode != 'startup_check_only':
+        log_info("Legacy 'startup_check' positional argument detected. Overriding to 'startup_check_only' mode.")
+        effective_startup_mode = 'startup_check_only'
+
+    is_full_app_run = (effective_startup_mode not in ['startup_check_only'])
+    if is_full_app_run:
+        check_single_instance()
 
     try:
-        if len(sys.argv) > 1 and sys.argv[1] == 'startup_check':
-            log_info("Running startup_check...")
-            temp_startup_root = tk.Tk()
-            temp_startup_root.withdraw()
-            today_str = date.today().strftime("%Y-%m-%d")
-            app_config = load_app_config()
-            last_check_date = app_config.get("last_startup_check_date")
-            if last_check_date != today_str:
-                log_info(f"Performing daily reminder summary for {today_str}.")
-                todays_reminders_list = get_all_todays_reminders() # Uses the simple "actual today" version
-                display_reminders_popup(todays_reminders_list, f"Reminders for Today ({today_str})", temp_startup_root)
-                app_config["last_startup_check_date"] = today_str
-                save_app_config(app_config)
-                log_info("Startup check complete.")
+        if effective_startup_mode == 'startup_check_only':
+            log_info("Running in 'startup_check_only' mode (utility popup and exit)...")
+            temp_utility_root = tk.Tk()
+            temp_utility_root.withdraw()
+            
+            app_config_util = load_app_config()
+            last_check_util = app_config_util.get("last_daily_popup_date")
+            today_str_util = date.today().strftime("%Y-%m-%d")
+
+            if last_check_util != today_str_util:
+                log_info(f"'startup_check_only' mode: Performing daily reminder summary for {today_str_util}.")
+                todays_reminders_list_util = get_all_todays_reminders()
+                if todays_reminders_list_util:
+                    display_reminders_popup(todays_reminders_list_util, f"Reminders for Today ({today_str_util})", temp_utility_root)
+                app_config_util["last_daily_popup_date"] = today_str_util
+                save_app_config(app_config_util)
+                log_info("'startup_check_only' mode: Check complete.")
             else:
-                log_info(f"Daily summary already shown for {today_str}.")
-            temp_startup_root.destroy()
+                log_info(f"'startup_check_only' mode: Daily summary already shown for {today_str_util} or no reminders for today.")
+            
+            temp_utility_root.destroy()
             sys.exit(0)
 
-        # --- Full Application Mode ---
-        SHOULD_START_HIDDEN = False
-        if len(sys.argv) > 1 and sys.argv[1] == 'start_minimized':
-            SHOULD_START_HIDDEN = True
-            log_info(f"{APP_NAME} starting minimized to tray.")
-        else:
-            log_info(f"{APP_NAME} starting in full mode.")
+        log_info(f"{APP_NAME} starting in full application mode: {effective_startup_mode}")
 
-        scheduler_thread = threading.Thread(target=run_scheduler, daemon=True); scheduler_thread.start()
-        
+        scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
+        scheduler_thread.start()
+
         main_window_root = tk.Tk()
         tk_root_window = main_window_root
-        
-        # Crucial: main_gui_visible needs to be set BEFORE ReminderApp is initialized
-        # if ReminderApp.__init__ depends on it (e.g., for showing its own startup popup)
-        main_gui_visible = not SHOULD_START_HIDDEN 
-        
-        app = ReminderApp(main_window_root)
-        
-        if SHOULD_START_HIDDEN:
-            main_window_root.withdraw()
-            # main_gui_visible is already False
 
-        # Start tray icon in a thread (must be after tk.Tk() is called for main app)
+        show_main_window_initially = True
+        
+        if effective_startup_mode == 'autostart_with_daily_check':
+            app_config = load_app_config()
+            last_daily_popup_date = app_config.get("last_daily_popup_date")
+            today_str = date.today().strftime("%Y-%m-%d")
+            if last_daily_popup_date != today_str:
+                log_info(f"Mode 'autostart_with_daily_check': Performing daily startup reminder summary for {today_str}.")
+                todays_reminders_list = get_all_todays_reminders()
+                if todays_reminders_list:
+                    display_reminders_popup(todays_reminders_list, f"Reminders for Today ({today_str})", parent_window=tk_root_window)
+                app_config["last_daily_popup_date"] = today_str
+                save_app_config(app_config)
+                log_info("Daily startup reminder summary complete.")
+            else:
+                log_info(f"Mode 'autostart_with_daily_check': Daily summary already shown for {today_str} or no reminders for today.")
+            show_main_window_initially = False
+
+        elif effective_startup_mode == 'minimized_only':
+            log_info("Mode 'minimized_only': Starting minimized to tray.")
+            show_main_window_initially = False
+
+        main_gui_visible = show_main_window_initially
+        app = ReminderApp(main_window_root)
+
+        if not show_main_window_initially:
+            main_window_root.withdraw()
+            main_gui_visible = False
+            log_info(f"{APP_NAME} UI started and minimized to tray.")
+        else:
+            log_info(f"{APP_NAME} UI started with main window visible.")
+
         tray_thread = threading.Thread(target=setup_system_tray, daemon=True)
         tray_thread.start()
-        
+
         log_info("Main GUI and Threads initialized. Entering Tkinter mainloop.")
         main_window_root.mainloop()
 
-    except SystemExit: # Allow sys.exit() to pass through for startup_check and lock fail
+    except SystemExit:
+        log_info("Application exited via sys.exit().")
         pass
     except Exception as e:
-        log_error(f"An unhandled error occurred: {e}")
-        messagebox.showerror("Critical Error", f"An unexpected error occurred: {e}\nThe application might need to close.")
+        log_error(f"An unhandled error occurred in main: {e}", exc_info=True)
+        try:
+            error_parent = tk_root_window if 'tk_root_window' in globals() and tk_root_window and tk_root_window.winfo_exists() else None
+            if not error_parent:
+                temp_error_root = tk.Tk()
+                temp_error_root.withdraw()
+                error_parent = temp_error_root
+            
+            messagebox.showerror("Critical Error", f"An unexpected error occurred: {e}\nThe application might need to close.", parent=error_parent)
+            
+            if not ('tk_root_window' in globals() and tk_root_window and tk_root_window.winfo_exists()):
+                temp_error_root.destroy()
+        except Exception as e_msgbox:
+            log_error(f"Could not display error in messagebox: {e_msgbox}")
     finally:
         log_info("Application is exiting. Cleaning up...")
-        if not is_utility_run: # Only cleanup lock if it was a full app run
-            cleanup_lock_file()
-        
         if 'scheduler_thread' in locals() and scheduler_thread.is_alive() and not scheduler_stop_event.is_set():
+            log_info("Stopping scheduler thread...")
             scheduler_stop_event.set()
-            scheduler_thread.join(timeout=2)
-        
-        # Tray icon stopping is handled by quit_application_action or program termination for daemon thread
+            scheduler_thread.join(timeout=3)
+            if scheduler_thread.is_alive():
+                log_warning("Scheduler thread did not stop in time.")
         log_info(f"{APP_NAME} finished.")

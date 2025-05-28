@@ -20,8 +20,10 @@ def install_autostart(app_path_to_register):
         command_to_run = app_path_to_register
         # Only add pythonw if it's a .py file and not already starting with python/pythonw
         if command_to_run.lower().endswith('.py') and not command_to_run.lower().startswith(('python ', 'pythonw ')):
-             # Use pythonw for silent execution of script
-             command_to_run = f'pythonw "{command_to_run}"'
+             # Use pythonw for silent execution of script and add the startup mode argument
+             command_to_run = f'pythonw "{command_to_run}" --startup-mode autostart_with_daily_check'
+        elif command_to_run.lower().endswith('.exe'): # If it's an executable
+             command_to_run = f'"{command_to_run}" --startup-mode autostart_with_daily_check'
 
         winreg.SetValueEx(key, "PersonalReminder", 0, winreg.REG_SZ, command_to_run)
         winreg.CloseKey(key)
