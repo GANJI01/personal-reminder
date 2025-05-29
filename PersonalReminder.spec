@@ -5,7 +5,7 @@ a = Analysis(
     ['remainder.py'],
     pathex=[],
     binaries=[],
-    datas=[('logo.png', '.')],
+    datas=[('my_new_icon.png', '.')],
     hiddenimports=['PIL._tkinter_finder', 'tkcalendar', 'babel.numbers'],
     hookspath=[],
     hooksconfig={},
@@ -35,5 +35,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['logo.ico'],
+    icon=['my_new_icon.ico'],
 )
